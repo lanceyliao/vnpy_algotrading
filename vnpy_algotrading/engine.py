@@ -62,12 +62,14 @@ class AlgoEngine(BaseEngine):
         from .algos.sniper_algo import SniperAlgo
         from .algos.stop_algo import StopAlgo
         from .algos.best_limit_algo import BestLimitAlgo
+        from .algos.volume_follow_algo import VolumeFollowAlgo
 
         self.add_algo_template(TwapAlgo)
         self.add_algo_template(IcebergAlgo)
         self.add_algo_template(SniperAlgo)
         self.add_algo_template(StopAlgo)
         self.add_algo_template(BestLimitAlgo)
+        self.add_algo_template(VolumeFollowAlgo)
 
     def add_algo_template(self, template: AlgoTemplate) -> None:
         """添加算法类"""
