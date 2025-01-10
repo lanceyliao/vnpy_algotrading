@@ -28,7 +28,7 @@ class AlgoTemplate:
         direction: Direction,
         offset: Offset,
         price: float,
-        volume: int,
+        volume: float,
         setting: dict
     ) -> None:
         """构造函数"""

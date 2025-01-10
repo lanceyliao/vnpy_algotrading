@@ -1,4 +1,4 @@
-from vnpy.trader.constant import Direction
+from vnpy.trader.constant import Direction, Offset
 from vnpy.trader.object import TradeData, OrderData, TickData
 from vnpy.trader.engine import BaseEngine
 
@@ -25,8 +25,8 @@ class IcebergAlgo(AlgoTemplate):
         algo_engine: BaseEngine,
         algo_name: str,
         vt_symbol: str,
-        direction: str,
-        offset: str,
+        direction: Direction,
+        offset: Offset,
         price: float,
         volume: float,
         setting: dict

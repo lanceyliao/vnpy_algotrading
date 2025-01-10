@@ -127,7 +127,7 @@ class AlgoEngine(BaseEngine):
         direction: Direction,
         offset: Offset,
         price: float,
-        volume: int,
+        volume: float,
         setting: dict
     ) -> str:
         """启动算法"""

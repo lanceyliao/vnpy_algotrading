@@ -1,5 +1,5 @@
 from vnpy.trader.utility import round_to
-from vnpy.trader.constant import Direction
+from vnpy.trader.constant import Direction, Offset
 from vnpy.trader.object import TradeData, TickData, ContractData
 from vnpy.trader.engine import BaseEngine
 
@@ -27,8 +27,8 @@ class TwapAlgo(AlgoTemplate):
         algo_engine: BaseEngine,
         algo_name: str,
         vt_symbol: str,
-        direction: str,
-        offset: str,
+        direction: Direction,
+        offset: Offset,
         price: float,
         volume: float,
         setting: dict
