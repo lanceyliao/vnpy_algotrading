@@ -42,6 +42,7 @@ class VolumeFollowAlgo(AlgoTemplate):
         self.vt_orderid: str = ""
         self.order_price: float = 0
         self.last_tick_volume: float = 0
+        self.is_first_tick: bool = True  # 标记是否是第一个tick
 
         self.put_event()
 
@@ -50,6 +51,12 @@ class VolumeFollowAlgo(AlgoTemplate):
         # 如果有活动委托，先撤单
         if self.vt_orderid:
             self.cancel_all()
+            return
+
+        # 处理第一个tick去减0的volume过大的情况
+        if self.is_first_tick:
+            self.last_tick_volume = tick.volume
+            self.is_first_tick = False
             return
 
         # 记录当前tick的成交量
