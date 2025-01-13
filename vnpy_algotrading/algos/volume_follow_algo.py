@@ -29,13 +29,14 @@ class VolumeFollowAlgo(AlgoTemplate):
         offset: Offset,
         price: float,
         volume: float,
-        setting: dict
+        setting: dict,
+        todo_id: int = 0
     ) -> None:
         """构造函数"""
-        super().__init__(algo_engine, algo_name, vt_symbol, direction, offset, price, volume, setting)
+        super().__init__(algo_engine, algo_name, vt_symbol, direction, offset, price, volume, setting, todo_id)
 
         # 参数
-        self.price_add_percent: float = setting["price_add_percent"]
+        self.price_add_percent: float = setting.get("price_add_percent", self.default_setting["price_add_percent"])
 
         # 变量
         self.vt_orderid: str = ""
@@ -65,12 +66,13 @@ class VolumeFollowAlgo(AlgoTemplate):
         # 计算剩余需要交易的数量
         volume_left: float = self.volume - self.traded
         order_volume: float = min(max_order_volume, volume_left)
+        self.write_log(f"剩余需要交易的数量: {volume_left:.2f}, 跟量拆单上限: {max_order_volume:.2f}, 实际委托数量: {order_volume:.2f}")
 
         # 根据方向计算委托价格
         if self.direction == Direction.LONG:
             # 买入超价：在卖一价上加价
             self.order_price = tick.ask_price_1 * (1 + self.price_add_percent / 100)
-            
+
             # 检查涨停价
             if tick.limit_up:
                 self.order_price = min(self.order_price, tick.limit_up)
@@ -83,7 +85,7 @@ class VolumeFollowAlgo(AlgoTemplate):
         else:
             # 卖出超价：在买一价下降价
             self.order_price = tick.bid_price_1 * (1 - self.price_add_percent / 100)
-            
+
             # 检查跌停价
             if tick.limit_down:
                 self.order_price = max(self.order_price, tick.limit_down)

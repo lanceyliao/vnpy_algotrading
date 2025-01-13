@@ -40,7 +40,7 @@ class AlgoEngine(BaseEngine):
 
         self.algo_templates: dict[str, Type[AlgoTemplate]] = {}
 
-        self.algos: dict[str, AlgoTemplate] = {}
+        self.algos: dict[int, AlgoTemplate] = {}  # todo_id: algo
         self.symbol_algo_map: dict[str, set[AlgoTemplate]] = defaultdict(set)
         self.orderid_algo_map: dict[str, AlgoTemplate] = {}
 
@@ -128,13 +128,14 @@ class AlgoEngine(BaseEngine):
         offset: Offset,
         price: float,
         volume: float,
-        setting: dict
-    ) -> str:
+        setting: dict,
+        todo_id: int = 0
+    ) -> int:
         """启动算法"""
         contract: Optional[ContractData] = self.main_engine.get_contract(vt_symbol)
         if not contract:
             self.write_log(f'算法启动失败，找不到合约：{vt_symbol}')
-            return ""
+            return 0
 
         algo_template: AlgoTemplate = self.algo_templates[template_name]
 
@@ -149,7 +150,8 @@ class AlgoEngine(BaseEngine):
             offset,
             price,
             volume,
-            setting
+            setting,
+            todo_id
         )
 
         # 订阅行情
@@ -160,32 +162,32 @@ class AlgoEngine(BaseEngine):
 
         # 启动算法
         algo.start()
-        self.algos[algo_name] = algo
+        self.algos[todo_id] = algo
 
-        return algo_name
+        return todo_id
 
-    def pause_algo(self, algo_name: str) -> None:
+    def pause_algo(self, todo_id: int) -> None:
         """暂停算法"""
-        algo: Optional[AlgoTemplate] = self.algos.get(algo_name, None)
+        algo: Optional[AlgoTemplate] = self.algos.get(todo_id, None)
         if algo:
             algo.pause()
 
-    def resume_algo(self, algo_name: str) -> None:
+    def resume_algo(self, todo_id: int) -> None:
         """恢复算法"""
-        algo: Optional[AlgoTemplate] = self.algos.get(algo_name, None)
+        algo: Optional[AlgoTemplate] = self.algos.get(todo_id, None)
         if algo:
             algo.resume()
 
-    def stop_algo(self, algo_name: str) -> None:
+    def stop_algo(self, todo_id: int) -> None:
         """停止算法"""
-        algo: Optional[AlgoTemplate] = self.algos.get(algo_name, None)
+        algo: Optional[AlgoTemplate] = self.algos.get(todo_id, None)
         if algo:
             algo.stop()
 
     def stop_all(self) -> None:
         """停止全部算法"""
-        for algo_name in list(self.algos.keys()):
-            self.stop_algo(algo_name)
+        for todo_id in list(self.algos.keys()):
+            self.stop_algo(todo_id)
 
     def subscribe(self, symbol: str, exchange: Exchange, gateway_name: str) -> None:
         """订阅行情"""
@@ -207,7 +209,10 @@ class AlgoEngine(BaseEngine):
         """委托下单"""
         contract: Optional[ContractData] = self.main_engine.get_contract(algo.vt_symbol)
         volume: float = round_to(volume, contract.min_volume)
-        if not volume:
+        price: float = round_to(price, contract.pricetick)
+        min_notional: float = contract.extra.get("min_notional", 0)
+
+        if not volume or not price or price * volume < min_notional:
             return ""
 
         req: OrderRequest = OrderRequest(
@@ -218,7 +223,7 @@ class AlgoEngine(BaseEngine):
             volume=volume,
             price=price,
             offset=offset,
-            reference=f"{APP_NAME}_{algo.algo_name}"
+            reference=f"{APP_NAME}_{algo.todo_id}"  # 使用todo_id作为引用
         )
         vt_orderid: str = self.main_engine.send_order(req, contract.gateway_name)
 
@@ -257,7 +262,7 @@ class AlgoEngine(BaseEngine):
     def write_log(self, msg: str, algo: AlgoTemplate = None) -> None:
         """输出日志"""
         if algo:
-            msg: str = f"{algo.algo_name}：{msg}"
+            msg: str = f"[{algo.todo_id}] {msg}"  # 使用todo_id标识算法单
 
         log: LogData = LogData(msg=msg, gateway_name=APP_NAME)
         event: Event = Event(EVENT_ALGO_LOG, data=log)
@@ -270,7 +275,7 @@ class AlgoEngine(BaseEngine):
             algo in self.algos.values()
             and algo.status in {AlgoStatus.STOPPED, AlgoStatus.FINISHED}
         ):
-            self.algos.pop(algo.algo_name)
+            self.algos.pop(algo.todo_id)
 
             for algos in self.symbol_algo_map.values():
                 if algo in algos:

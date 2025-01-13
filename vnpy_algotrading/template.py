@@ -29,7 +29,8 @@ class AlgoTemplate:
         offset: Offset,
         price: float,
         volume: float,
-        setting: dict
+        setting: dict,
+        todo_id: int = 0  # 关联的Todo ID
     ) -> None:
         """构造函数"""
         self.algo_engine: BaseEngine = algo_engine
@@ -39,7 +40,8 @@ class AlgoTemplate:
         self.direction: Direction = direction
         self.offset: Offset = offset
         self.price: float = price
-        self.volume: int = volume
+        self.volume: float = volume
+        self.todo_id: int = todo_id
 
         self.status: AlgoStatus = AlgoStatus.PAUSED
         self.traded: float = 0
@@ -225,7 +227,8 @@ class AlgoTemplate:
             "left": self.volume - self.traded,
             "traded_price": self.traded_price,
             "parameters": self.get_parameters(),
-            "variables": self.get_variables()
+            "variables": self.get_variables(),
+            "todo_id": self.todo_id
         }
         return algo_data
 
