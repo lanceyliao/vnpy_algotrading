@@ -227,6 +227,9 @@ class AlgoEngine(BaseEngine):
         )
         vt_orderid: str = self.main_engine.send_order(req, contract.gateway_name)
 
+        msg: str = f"委托下单: {algo.vt_symbol}, {direction}, {offset}, {volume}@{price}"
+        self.write_log(msg, algo)
+
         self.orderid_algo_map[vt_orderid] = algo
         return vt_orderid
 

@@ -144,9 +144,6 @@ class AlgoTemplate:
         if self.status != AlgoStatus.RUNNING:
             return
 
-        msg: str = f"{self.vt_symbol}，委托买入{order_type.value}，{volume}@{price}"
-        self.write_log(msg)
-
         return self.algo_engine.send_order(
             self,
             Direction.LONG,
@@ -166,9 +163,6 @@ class AlgoTemplate:
         """卖出"""
         if self.status != AlgoStatus.RUNNING:
             return
-
-        msg: str = f"{self.vt_symbol}委托卖出{order_type.value}，{volume}@{price}"
-        self.write_log(msg)
 
         return self.algo_engine.send_order(
             self,
