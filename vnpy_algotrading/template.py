@@ -4,7 +4,7 @@ from vnpy.trader.engine import BaseEngine
 from vnpy.trader.object import TickData, OrderData, TradeData, ContractData
 from vnpy.trader.constant import OrderType, Offset, Direction
 from vnpy.trader.utility import virtual
-
+import sys
 from .base import AlgoStatus
 
 if TYPE_CHECKING:
@@ -228,7 +228,11 @@ class AlgoTemplate:
 
     def write_log(self, msg: str) -> None:
         """输出日志"""
-        self.algo_engine.write_log(msg, self)
+        frame = sys._getframe(1)
+        func_name = frame.f_code.co_name
+        class_name = self.__class__.__name__
+        formatted_msg = f"[{class_name}.{func_name}] {msg}"
+        self.algo_engine.write_log(formatted_msg, self)
 
     def put_event(self) -> None:
         """推送更新"""

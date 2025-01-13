@@ -29,7 +29,7 @@ from .base import (
     APP_NAME,
     AlgoStatus
 )
-
+import sys
 
 class AlgoEngine(BaseEngine):
     """算法引擎"""
@@ -212,7 +212,14 @@ class AlgoEngine(BaseEngine):
         price: float = round_to(price, contract.pricetick)
         min_notional: float = contract.extra.get("min_notional", 0)
 
-        if not volume or not price or price * volume < min_notional:
+        if not volume:
+            self.write_log(f"委托数量为0，不生成委托")
+            return ""
+        if not price:
+            self.write_log(f"委托价格为0，不生成委托")
+            return ""
+        if price * volume < min_notional:
+            self.write_log(f"委托数量{volume}和价格{price}乘积小于最小名义价值{min_notional}，不生成委托")
             return ""
 
         req: OrderRequest = OrderRequest(
@@ -265,9 +272,14 @@ class AlgoEngine(BaseEngine):
     def write_log(self, msg: str, algo: AlgoTemplate = None) -> None:
         """输出日志"""
         if algo:
-            msg: str = f"[{algo.todo_id}] {msg}"  # 使用todo_id标识算法单
+            formatted_msg: str = f"[{algo.todo_id}] {msg}"  # 使用todo_id标识算法单
+        else:
+            frame = sys._getframe(1)
+            func_name = frame.f_code.co_name
+            class_name = self.__class__.__name__
+            formatted_msg = f"[{class_name}.{func_name}] {msg}"
 
-        log: LogData = LogData(msg=msg, gateway_name=APP_NAME)
+        log: LogData = LogData(msg=formatted_msg, gateway_name=APP_NAME)
         event: Event = Event(EVENT_ALGO_LOG, data=log)
         self.event_engine.put(event)
 

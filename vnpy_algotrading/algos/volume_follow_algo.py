@@ -69,6 +69,7 @@ class VolumeFollowAlgo(AlgoTemplate):
 
         # 检查委托数量是否为0
         if order_volume <= 0:
+            self.write_log(f"上一tick成交量为0，不生成委托")
             return
 
         self.write_log(f"剩余需要交易的数量: {volume_left}, 跟量拆单上限: {max_order_volume}")
