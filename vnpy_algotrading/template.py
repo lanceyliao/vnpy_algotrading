@@ -1,14 +1,60 @@
 from typing import Optional, TYPE_CHECKING
+from datetime import datetime
 
 from vnpy.trader.engine import BaseEngine
 from vnpy.trader.object import TickData, OrderData, TradeData, ContractData
-from vnpy.trader.constant import OrderType, Offset, Direction
+from vnpy.trader.constant import OrderType, Offset, Direction, Status
 from vnpy.trader.utility import virtual
 import sys
 from .base import AlgoStatus
 
 if TYPE_CHECKING:
     from .engine import AlgoEngine
+
+class OrderLifecycle:
+    """订单生命周期追踪"""
+    def __init__(self, vt_orderid: str):
+        self.vt_orderid = vt_orderid
+        self.create_time = datetime.now()  # 创建时间
+        self.submit_time = None  # 提交时间
+        self.cancel_time = None  # 撤单时间
+        self.trade_time = None  # 成交时间
+        self.status = Status.SUBMITTING  # 当前状态
+
+    def on_order(self, order: OrderData) -> None:
+        """更新订单状态"""
+        self.status = order.status
+        if order.status == Status.NOTTRADED:
+            self.submit_time = datetime.now()
+        elif order.status == Status.CANCELLED:
+            self.cancel_time = datetime.now()
+
+    def on_trade(self, trade: TradeData) -> None:
+        """更新成交状态"""
+        self.trade_time = datetime.now()
+
+    def get_lifecycle_msg(self) -> str:
+        """获取生命周期信息"""
+        now = datetime.now()
+        msg_parts = []
+
+        if self.submit_time:
+            submit_delay = (self.submit_time - self.create_time).total_seconds()
+            msg_parts.append(f"提交耗时: {submit_delay:.3f}秒")
+
+        if self.trade_time:
+            trade_delay = (self.trade_time - self.create_time).total_seconds()
+            msg_parts.append(f"成交耗时: {trade_delay:.3f}秒")
+
+        if self.cancel_time:
+            cancel_delay = (self.cancel_time - self.create_time).total_seconds()
+            msg_parts.append(f"撤单耗时: {cancel_delay:.3f}秒")
+
+        total_time = (now - self.create_time).total_seconds()
+        msg_parts.append(f"当前状态: {self.status.value}")
+        msg_parts.append(f"总耗时: {total_time:.3f}秒")
+
+        return ", ".join(msg_parts)
 
 
 class AlgoTemplate:
@@ -48,6 +94,7 @@ class AlgoTemplate:
         self.traded_price: float = 0
 
         self.active_orders: dict[str, OrderData] = {}  # vt_orderid:order
+        self.order_lifecycles: dict[str, OrderLifecycle] = {}  # vt_orderid:lifecycle
 
     def update_tick(self, tick: TickData) -> None:
         """行情数据更新"""
@@ -56,6 +103,15 @@ class AlgoTemplate:
 
     def update_order(self, order: OrderData) -> None:
         """委托数据更新"""
+        if order.vt_orderid not in self.order_lifecycles:
+            self.order_lifecycles[order.vt_orderid] = OrderLifecycle(order.vt_orderid)
+
+        lifecycle = self.order_lifecycles[order.vt_orderid]
+        lifecycle.on_order(order)
+
+        # 输出订单生命周期信息
+        self.write_log(f"订单 {order.vt_orderid} - {lifecycle.get_lifecycle_msg()}")
+
         if order.is_active():
             self.active_orders[order.vt_orderid] = order
         elif order.vt_orderid in self.active_orders:
@@ -65,6 +121,11 @@ class AlgoTemplate:
 
     def update_trade(self, trade: TradeData) -> None:
         """成交数据更新"""
+        if trade.vt_orderid in self.order_lifecycles:
+            lifecycle = self.order_lifecycles[trade.vt_orderid]
+            lifecycle.on_trade(trade)
+            self.write_log(f"订单 {trade.vt_orderid} - {lifecycle.get_lifecycle_msg()}")
+
         cost: float = self.traded_price * self.traded + trade.price * trade.volume
         self.traded += trade.volume
         self.traded_price = cost / self.traded
