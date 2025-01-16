@@ -68,17 +68,15 @@ class VolumeFollowAlgo(AlgoTemplate):
         """
         更新订单状态和相关数量
         """
-        # 首次收到订单回报时更新总发单量
-        if vt_orderid not in self.order_volumes:
-            # 计算订单量差异
-            original_volume = self.order_volumes.get(vt_orderid, order_volume)
-            volume_diff = original_volume - order_volume
-            if volume_diff > 0:
-                self.total_ordered -= volume_diff
-                self.write_log(f"订单量被修改: {vt_orderid}, "
-                               f"原始数量: {original_volume}, "
-                               f"实际数量: {order_volume}, "
-                               f"更新后总发单量: {self.total_ordered}")
+        # 计算订单量差异
+        original_volume = self.order_volumes.get(vt_orderid, order_volume)
+        volume_diff = original_volume - order_volume
+        if volume_diff > 0:
+            self.total_ordered -= volume_diff
+            self.write_log(f"订单量被修改: {vt_orderid}, "
+                            f"原始数量: {original_volume}, "
+                            f"实际数量: {order_volume}, "
+                            f"更新后总发单量: {self.total_ordered}")
 
         # 计算之前的挂单量
         old_pending = self.order_volumes.get(vt_orderid, 0) - self.order_traded.get(vt_orderid, 0)
