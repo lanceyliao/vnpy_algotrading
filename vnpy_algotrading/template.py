@@ -2,7 +2,7 @@ from typing import Optional, TYPE_CHECKING
 
 from vnpy.trader.engine import BaseEngine
 from vnpy.trader.object import TickData, OrderData, TradeData, ContractData
-from vnpy.trader.constant import OrderType, Offset, Direction, Status
+from vnpy.trader.constant import OrderType, Offset, Direction
 from vnpy.trader.utility import virtual
 import sys
 from .base import AlgoStatus
@@ -48,7 +48,6 @@ class AlgoTemplate:
         self.traded_price: float = 0
 
         self.active_orders: dict[str, OrderData] = {}  # vt_orderid:order
-        self.cancelling_orders: set[str] = set()  # 已发出撤单指令的订单集合
 
     def update_tick(self, tick: TickData) -> None:
         """行情数据更新"""
@@ -57,16 +56,10 @@ class AlgoTemplate:
 
     def update_order(self, order: OrderData) -> None:
         """委托数据更新"""
-        # 如果订单已经完成（包括撤销），从cancelling_orders中移除
-        if order.status == Status.CANCELLED:
-            if order.vt_orderid in self.cancelling_orders:
-                self.cancelling_orders.remove(order.vt_orderid)
-
         self.on_order(order)
 
     def update_trade(self, trade: TradeData) -> None:
         """成交数据更新"""
-        # 更新成交均价
         cost: float = self.traded_price * self.traded + trade.price * trade.volume
         self.traded += trade.volume
         self.traded_price = cost / self.traded
@@ -178,14 +171,8 @@ class AlgoTemplate:
         )
 
     def cancel_order(self, vt_orderid: str) -> None:
-        """
-        撤销订单
-        如果订单不在cancelling_orders中才发出撤单指令
-        """
-        if vt_orderid not in self.cancelling_orders:
-            self.cancelling_orders.add(vt_orderid)
-            self.algo_engine.cancel_order(self, vt_orderid)
-            self.write_log(f"发出撤单指令: {vt_orderid}")
+        """撤销委托"""
+        self.algo_engine.cancel_order(self, vt_orderid)
 
     def cancel_all(self) -> None:
         """全撤委托"""
