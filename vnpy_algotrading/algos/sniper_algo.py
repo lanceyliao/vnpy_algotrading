@@ -67,6 +67,7 @@ class SniperAlgo(AlgoTemplate):
         if not order.is_active():
             self.vt_orderid = ""
             self.put_event()
+        super().on_order(order)
 
     def on_trade(self, trade: TradeData) -> None:
         """成交回调"""

@@ -86,6 +86,7 @@ class BestLimitAlgo(AlgoTemplate):
             self.vt_orderid = ""
             self.order_price = 0
             self.put_event()
+        super().on_order(order)
 
     def buy_best_limit(self, bid_price_1: float) -> None:
         """最优限价买入"""

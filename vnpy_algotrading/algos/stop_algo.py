@@ -83,6 +83,7 @@ class StopAlgo(AlgoTemplate):
         """委托回调"""
         self.order_status = order.status
         self.put_event()
+        super().on_order(order)
 
     def on_trade(self, trade: TradeData) -> None:
         """成交回调"""
