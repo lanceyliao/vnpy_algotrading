@@ -210,8 +210,18 @@ class VolumeFollowAlgo(AlgoTemplate):
         # 更新订单状态和数量
         self.update_order_status(order.vt_orderid, order.volume, order.traded)
 
-        # 如果订单已完成，清理记录
+        # 如果订单已完成（包括撤销），清理记录
         if not order.is_active():
+            # 如果是撤单，需要减去未成交部分的挂单量
+            if order.status == Status.CANCELLED:
+                unfilled = order.volume - order.traded
+                if unfilled > 0:
+                    self.total_pending = max(0, self.total_pending - unfilled)
+                    self.write_log(f"订单已撤销: {order.vt_orderid}, "
+                                   f"未成交数量: {unfilled}, "
+                                   f"更新后总挂单量: {self.total_pending}")
+
+            # 清理相关字典中的记录
             if order.vt_orderid in self.order_volumes:
                 self.order_volumes.pop(order.vt_orderid)
             if order.vt_orderid in self.order_traded:
