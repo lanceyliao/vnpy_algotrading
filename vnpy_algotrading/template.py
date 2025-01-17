@@ -56,6 +56,11 @@ class AlgoTemplate:
 
     def update_order(self, order: OrderData) -> None:
         """委托数据更新"""
+        if order.is_active():
+            self.active_orders[order.vt_orderid] = order
+        elif order.vt_orderid in self.active_orders:
+            self.active_orders.pop(order.vt_orderid)
+
         self.on_order(order)
 
     def update_trade(self, trade: TradeData) -> None:
@@ -76,12 +81,10 @@ class AlgoTemplate:
         """行情回调"""
         pass
 
+    @virtual
     def on_order(self, order: OrderData) -> None:
         """委托回调"""
-        if order.is_active():
-            self.active_orders[order.vt_orderid] = order
-        elif order.vt_orderid in self.active_orders:
-            self.active_orders.pop(order.vt_orderid)
+        pass
 
     @virtual
     def on_trade(self, trade: TradeData) -> None:

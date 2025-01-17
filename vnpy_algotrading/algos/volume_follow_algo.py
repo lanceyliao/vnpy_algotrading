@@ -1,5 +1,5 @@
 from datetime import datetime
-from vnpy.trader.constant import Direction, Offset, Status
+from vnpy.trader.constant import Direction, Offset, Status, OrderType
 from vnpy.trader.object import TradeData, OrderData, TickData
 from vnpy.trader.engine import BaseEngine
 
@@ -18,9 +18,7 @@ class VolumeFollowAlgo(AlgoTemplate):
 
     variables: list = [
         "order_price",
-        "last_tick_volume",
-        "total_ordered",  # 已发出的订单总量
-        "total_pending"  # 当前挂单总量
+        "last_tick_volume"
     ]
 
     def __init__(
@@ -49,55 +47,27 @@ class VolumeFollowAlgo(AlgoTemplate):
         self.order_time_map: dict[str, datetime] = {}  # vt_orderid: order_time，记录订单的发出时间
 
         # 订单量跟踪
-        self.total_ordered: float = 0  # 已发出的订单总量
-        self.total_pending: float = 0  # 当前挂单总量
-        self.order_volumes: dict[str, float] = {}  # vt_orderid: 实际发出量
-        self.order_traded: dict[str, float] = {}  # vt_orderid: 已成交量
+        self.order_volumes: dict[str, float] = {}  # vt_orderid: 已发出但未收到回报的订单量
 
         self.put_event()
 
-    def get_remaining_volume(self) -> float:
+    def get_total_pending(self) -> float:
         """
-        获取剩余可发送的订单量
-        需要考虑：已成交量(self.traded) + 未成交挂单量(self.total_pending)
+        计算总挂单量：
+        1. 已发出但未收到回报的订单：使用发出时的volume
+        2. 已收到回报的活跃订单：使用order.volume - order.traded
         """
-        remaining = self.volume - self.traded - self.total_pending
-        return max(0, remaining)
+        total = 0
 
-    def update_order_status(self, vt_orderid: str, order_volume: float, traded: float) -> None:
-        """
-        更新订单状态和相关数量
-        """
-        # 计算订单量差异
-        original_volume = self.order_volumes.get(vt_orderid, order_volume)
-        volume_diff = original_volume - order_volume
-        if volume_diff > 0:
-            self.total_ordered -= volume_diff
-            self.write_log(f"订单量被修改: {vt_orderid}, "
-                            f"原始数量: {original_volume}, "
-                            f"实际数量: {order_volume}, "
-                            f"更新后总发单量: {self.total_ordered}")
+        # 计算已收到回报的活跃订单的待成交量
+        for order in self.active_orders.values():
+            total += order.volume - order.traded
 
-        # 计算之前的挂单量
-        old_pending = self.order_volumes.get(vt_orderid, 0) - self.order_traded.get(vt_orderid, 0)
+        # 加上已发出但未收到回报的订单量
+        for volume in self.order_volumes.values():
+            total += volume
 
-        # 更新订单信息
-        self.order_volumes[vt_orderid] = order_volume
-        self.order_traded[vt_orderid] = traded
-
-        # 计算新的挂单量
-        new_pending = order_volume - traded
-
-        # 更新总挂单量
-        self.total_pending = self.total_pending - old_pending + new_pending
-
-        self.write_log(f"订单状态更新: {vt_orderid}, "
-                       f"订单量: {order_volume}, "
-                       f"已成交: {traded}, "
-                       f"挂单中: {new_pending}, "
-                       f"总挂单量: {self.total_pending}, "
-                       f"总发单量: {self.total_ordered}, "
-                       f"总成交量: {self.traded}")
+        return total
 
     def on_tick(self, tick: TickData) -> None:
         """Tick行情回调"""
@@ -155,14 +125,6 @@ class VolumeFollowAlgo(AlgoTemplate):
         if order_volume <= 0:
             return
 
-        self.write_log(
-            f"剩余可发送订单量: {volume_left}, "
-            f"当前挂单总量: {self.total_pending}, "
-            f"已发送总量: {self.total_ordered}, "
-            f"已成交总量: {self.traded}, "
-            f"跟量拆单上限: {max_order_volume}"
-        )
-
         # 根据方向计算委托价格
         if self.direction == Direction.LONG:
             # 买入超价：在卖一价上加价
@@ -194,65 +156,34 @@ class VolumeFollowAlgo(AlgoTemplate):
         # 记录订单信息
         if vt_orderid:
             self.order_volumes[vt_orderid] = order_volume
-            self.order_traded[vt_orderid] = 0
-            self.total_ordered += order_volume
-            self.total_pending += order_volume
             self.order_time_map[vt_orderid] = tick.datetime
-            self.write_log(f"发出新订单: {vt_orderid}, "
-                           f"数量: {order_volume}, "
-                           f"累计发送量: {self.total_ordered}, "
-                           f"当前挂单量: {self.total_pending}")
 
         self.put_event()
 
     def on_order(self, order: OrderData) -> None:
         """委托回调"""
-        # 更新订单状态和数量
-        self.update_order_status(order.vt_orderid, order.volume, order.traded)
+        # 收到订单回报后，移除已发出订单记录
+        if order.vt_orderid in self.order_volumes:
+            self.order_volumes.pop(order.vt_orderid)
 
-        # 如果订单已完成（包括撤销），清理记录
+        # 如果订单已完成，清理记录
         if not order.is_active():
-            # 如果是撤单，需要减去未成交部分的挂单量
-            if order.status == Status.CANCELLED:
-                unfilled = order.volume - order.traded
-                if unfilled > 0:
-                    self.total_pending = max(0, self.total_pending - unfilled)
-                    self.write_log(f"订单已撤销: {order.vt_orderid}, "
-                                   f"未成交数量: {unfilled}, "
-                                   f"更新后总挂单量: {self.total_pending}")
-
-            # 清理相关字典中的记录
-            if order.vt_orderid in self.order_volumes:
-                self.order_volumes.pop(order.vt_orderid)
-            if order.vt_orderid in self.order_traded:
-                self.order_traded.pop(order.vt_orderid)
             if order.vt_orderid in self.order_time_map:
                 self.order_time_map.pop(order.vt_orderid)
             self.put_event()
 
-        # 更新订单状态
-        super().on_order(order)
-
     def on_trade(self, trade: TradeData) -> None:
         """成交回调"""
-        # 更新订单成交状态
-        old_traded = self.order_traded.get(trade.vt_orderid, 0)
-        new_traded = old_traded + trade.volume
-        self.order_traded[trade.vt_orderid] = new_traded
-
-        # 更新挂单量
-        order_volume = self.order_volumes.get(trade.vt_orderid, 0)
-        self.total_pending = max(0, self.total_pending - trade.volume)
-
-        self.write_log(f"收到成交回报: {trade.vt_orderid}, "
-                       f"成交数量: {trade.volume}, "
-                       f"订单总量: {order_volume}, "
-                       f"订单已成交: {new_traded}, "
-                       f"总挂单量: {self.total_pending}, "
-                       f"总成交量: {self.traded}")
-
         if self.traded >= self.volume:
             self.write_log(f"已交易数量：{self.traded}，总数量：{self.volume}")
             self.finish()
         else:
-            self.put_event() 
+            self.put_event()
+
+    def get_remaining_volume(self) -> float:
+        """
+        获取剩余可发送的订单量
+        需要考虑：已成交量(self.traded) + 未成交挂单量(total_pending)
+        """
+        remaining = self.volume - self.traded - self.get_total_pending()
+        return max(0, remaining)
