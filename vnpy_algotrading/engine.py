@@ -135,7 +135,7 @@ class AlgoEngine(BaseEngine):
         contract: Optional[ContractData] = self.main_engine.get_contract(vt_symbol)
         if not contract:
             self.write_log(f'算法启动失败，找不到合约：{vt_symbol}')
-            return 0
+            return -1
 
         algo_template: AlgoTemplate = self.algo_templates[template_name]
 
