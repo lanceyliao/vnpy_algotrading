@@ -6,10 +6,10 @@ from vnpy.trader.engine import BaseEngine
 from ..template import AlgoTemplate
 
 
-class VolumeFollowAlgo(AlgoTemplate):
+class VolumeFollowSyncAlgo(AlgoTemplate):
     """跟量算法"""
 
-    display_name: str = "VolumeFollow 跟量"
+    display_name: str = "VolumeFollowSync 跟量同步"
 
     default_setting: dict = {
         "price_add_percent": 2.0,  # 超价比例
