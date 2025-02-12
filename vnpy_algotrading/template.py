@@ -238,3 +238,7 @@ class AlgoTemplate:
         """推送更新"""
         data: dict = self.get_data()
         self.algo_engine.put_algo_event(self, data)
+
+    def get_holding(self) -> float:
+        """获取当前持仓"""
+        return self.algo_engine.get_holding(self.vt_symbol)

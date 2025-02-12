@@ -50,7 +50,7 @@ class Todo(ModelBase):
     level = IntegerField()
     ref = IntegerField()  # 子任务对应的父任务id
     user = CharField()
-    completed = IntegerField()  # 1任务创建 2任务完成 5任务异常完成
+    completed = IntegerField()  # 10任务创建 11任务完成 5任务异常完成
     datetime = DateTimeField()
     create_date = DateTimeField()
     create_by = CharField()

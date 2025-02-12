@@ -123,51 +123,101 @@ class VolumeFollowAlgo(AlgoTemplate):
 
         # 计算剩余可发送的订单量
         volume_left: float = self.volume - self.traded
-        if volume_left <= 0:
+        if volume_left == 0:
             return
 
         # 计算委托数量
-        order_volume: float = min(max_order_volume, volume_left)
+        order_volume: float = min(max_order_volume, abs(volume_left))
         if order_volume <= 0:
             return
             
         # 根据方向计算委托价格
-        if self.direction == Direction.LONG:
+        if self.direction == Direction.LONG or (self.direction == Direction.SHORT and volume_left < 0):
             # 买入超价：在卖一价上加价
             order_price = self.tick.ask_price_1 * (1 + self.price_add_percent / 100)
             # 检查涨停价
             if self.tick.limit_up:
                 order_price = min(order_price, self.tick.limit_up)
-        else:
+        elif self.direction == Direction.SHORT or (self.direction == Direction.LONG and volume_left < 0):
             # 卖出超价：在买一价下降价
             order_price = self.tick.bid_price_1 * (1 - self.price_add_percent / 100)
             # 检查跌停价
             if self.tick.limit_down:
                 order_price = max(order_price, self.tick.limit_down)
-            
+        else:
+            return
+
         order_volume = round_to(order_volume, contract.min_volume)
         order_price = round_to(order_price, contract.pricetick)
         min_notional: float = contract.extra.get("min_notional", 0)
-        if min_notional > 0:
-            # 检查当前订单的名义价值
-            current_notional = order_price * order_volume
-            if current_notional < min_notional:
-                self.write_log(f"当前订单量{order_volume}名义价值 {current_notional} 小于最小名义价值 {min_notional}")
+
+        # 如果volume_left < 0，说明是之前发送大于min_notional的订单导致的超发
+        if volume_left < 0:
+            # 发送反向平仓单
+            if self.direction == Direction.LONG:
+                vt_orderid = self.sell(order_price, abs(volume_left), offset=Offset.CLOSE)
+            else:
+                vt_orderid = self.buy(order_price, abs(volume_left), offset=Offset.CLOSE)
+
+            if vt_orderid:
+                self.pending_orderids.add(vt_orderid)
+                reverse_direction = "空头" if self.direction == Direction.LONG else "多头"
+                self.write_log(f"发送反向平仓订单 {vt_orderid}，方向：{reverse_direction}，价格：{order_price}，数量：{abs(volume_left)}")
+            return
+
+        if min_notional <= 0:
+            return
+
+        # 检查当前订单的名义价值
+        current_notional = order_price * order_volume
+        if current_notional < min_notional:
+            # 获取当前持仓
+            current_pos = self.get_holding()
+
+            # 计算方向相关的volume_left
+            dir_volume_left = volume_left if self.direction == Direction.LONG else -volume_left
+
+            # 情况1：持仓与volume_left方向相反且持仓绝对值大于等于volume_left
+            if (current_pos * dir_volume_left < 0 and abs(current_pos) >= abs(volume_left)):
+                # 直接平仓
+                if self.direction == Direction.LONG:
+                    vt_orderid = self.buy(order_price, volume_left, offset=Offset.CLOSE)
+                else:
+                    vt_orderid = self.sell(order_price, volume_left, offset=Offset.CLOSE)
+
+                if vt_orderid:
+                    self.pending_orderids.add(vt_orderid)
+                    self.write_log(f"发送平仓订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{volume_left}")
                 return
                 
-            # 检查剩余未成交部分是否满足最小名义价值
-            remaining_volume = round_to(volume_left - order_volume, contract.min_volume)
-            if remaining_volume > 0:
-                remaining_notional = order_price * remaining_volume * 0.95
-                if remaining_notional < min_notional:
-                    self.write_log(f"剩余订单量{remaining_volume}名义价值 {remaining_notional} 小于最小名义价值 {min_notional}")
-                    return
+            # 情况2：发送最小的大于等于min_notional的订单
+            min_volume = min_notional / order_price
+            min_volume = round_to(min_volume, contract.min_volume)
+            if min_volume * order_price < min_notional:  # 确保四舍五入后的volume对应的金额仍然大于等于min_notional
+                min_volume = round_to(min_volume + contract.min_volume, contract.min_volume)
 
-        # 发送订单
+            if self.direction == Direction.LONG:
+                vt_orderid = self.buy(order_price, min_volume)
+            else:
+                vt_orderid = self.sell(order_price, min_volume)
+
+            if vt_orderid:
+                self.pending_orderids.add(vt_orderid)
+                self.write_log(f"发送最小名义价值订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{min_volume}")
+            return
+
+        # 检查剩余未成交部分是否满足最小名义价值
+        remaining_volume = round_to(volume_left - order_volume, contract.min_volume)
+        if remaining_volume > 0:
+            remaining_notional = order_price * remaining_volume * 0.5
+            if remaining_notional < min_notional:
+                return
+
+        # 发送普通订单
         if self.direction == Direction.LONG:
-            vt_orderid = self.buy(order_price, order_volume, offset=self.offset)
+            vt_orderid = self.buy(order_price, order_volume)
         else:
-            vt_orderid = self.sell(order_price, order_volume, offset=self.offset)
+            vt_orderid = self.sell(order_price, order_volume)
 
         # 记录已发出但未收到回报的订单号
         if vt_orderid:
@@ -195,7 +245,7 @@ class VolumeFollowAlgo(AlgoTemplate):
         """成交回调"""
         self.write_log(f"收到成交回报 {trade.vt_orderid}，价格：{trade.price}，数量：{trade.volume}，方向：{trade.direction}")
         
-        if self.traded >= self.volume:
+        if self.traded == self.volume:
             self.write_log(f"已交易数量：{self.traded}，总数量：{self.volume}，算法执行完成")
             self.finish()
         else:
@@ -206,7 +256,7 @@ class VolumeFollowAlgo(AlgoTemplate):
                 return
                 
             # 使用round_to处理精度后再比较
-            if round_to(self.traded - self.volume, contract.min_volume) >= 0:
+            if round_to(self.traded - self.volume, contract.min_volume) == 0:
                 self.write_log(f"已交易数量：{self.traded}，总数量：{self.volume}，算法执行完成")
                 self.finish()
             else:

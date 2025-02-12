@@ -29,6 +29,7 @@ from .base import (
     APP_NAME,
     AlgoStatus
 )
+from .converter import PositionManager
 import sys
 
 class AlgoEngine(BaseEngine):
@@ -43,6 +44,8 @@ class AlgoEngine(BaseEngine):
         self.algos: dict[int, AlgoTemplate] = {}  # todo_id: algo
         self.symbol_algo_map: dict[str, set[AlgoTemplate]] = defaultdict(set)
         self.orderid_algo_map: dict[str, AlgoTemplate] = {}
+
+        self.position_manager: PositionManager = PositionManager(event_engine)
 
         self.load_algo_template()
         self.register_event()
@@ -298,3 +301,8 @@ class AlgoEngine(BaseEngine):
 
         event: Event = Event(EVENT_ALGO_UPDATE, data)
         self.event_engine.put(event)
+
+    def get_holding(self, vt_symbol: str) -> float:
+        """获取指定合约的持仓数量"""
+        return self.position_manager.get_position(vt_symbol)
+
