@@ -120,109 +120,135 @@ class VolumeFollowAlgo(AlgoTemplate):
         
         # 计算最大委托数量：成交量的1/5
         max_order_volume: float = self.tick_volume / 5
+        max_order_volume = round_to(max_order_volume, contract.min_volume)
 
         # 计算剩余可发送的订单量
         volume_left: float = self.volume - self.traded
-        if volume_left == 0:
-            return
-
-        # 计算委托数量
-        order_volume: float = min(max_order_volume, abs(volume_left))
-        if order_volume <= 0:
+        volume_left = round_to(volume_left, contract.min_volume)
+        
+        order_volume_abs: float = min(max_order_volume, abs(volume_left))
+        if order_volume_abs == 0:
             return
             
         # 根据方向计算委托价格
-        if self.direction == Direction.LONG or (self.direction == Direction.SHORT and volume_left < 0):
+        if self.direction == Direction.LONG and volume_left > 0 or self.direction == Direction.SHORT and volume_left < 0:
             # 买入超价：在卖一价上加价
-            order_price = self.tick.ask_price_1 * (1 + self.price_add_percent / 100)
+            order_price = self.tick.last_price * (1 + self.price_add_percent / 100)
             # 检查涨停价
             if self.tick.limit_up:
                 order_price = min(order_price, self.tick.limit_up)
-        elif self.direction == Direction.SHORT or (self.direction == Direction.LONG and volume_left < 0):
+        elif self.direction == Direction.SHORT and volume_left > 0 or self.direction == Direction.LONG and volume_left < 0:
             # 卖出超价：在买一价下降价
-            order_price = self.tick.bid_price_1 * (1 - self.price_add_percent / 100)
+            order_price = self.tick.last_price * (1 - self.price_add_percent / 100)
             # 检查跌停价
             if self.tick.limit_down:
                 order_price = max(order_price, self.tick.limit_down)
         else:
-            return
-
-        order_volume = round_to(order_volume, contract.min_volume)
+            return            
         order_price = round_to(order_price, contract.pricetick)
+
         min_notional: float = contract.extra.get("min_notional", 0)
-
-        # 如果volume_left < 0，说明是之前发送大于min_notional的订单导致的超发
-        if volume_left < 0:
-            # 发送反向平仓单
-            if self.direction == Direction.LONG:
-                vt_orderid = self.sell(order_price, abs(volume_left), offset=Offset.CLOSE)
-            else:
-                vt_orderid = self.buy(order_price, abs(volume_left), offset=Offset.CLOSE)
-
-            if vt_orderid:
-                self.pending_orderids.add(vt_orderid)
-                reverse_direction = "空头" if self.direction == Direction.LONG else "多头"
-                self.write_log(f"发送反向平仓订单 {vt_orderid}，方向：{reverse_direction}，价格：{order_price}，数量：{abs(volume_left)}")
+        if min_notional == 0:
             return
 
-        if min_notional <= 0:
-            return
+        vt_orderid = None
 
-        # 检查当前订单的名义价值
-        current_notional = order_price * order_volume
-        if current_notional < min_notional:
-            # 获取当前持仓
-            current_pos = self.get_holding()
+        if volume_left > 0:
+            # 检查当前订单的名义价值
+            current_notional = order_price * order_volume_abs
+            if current_notional >= min_notional:
+                # 检查剩余未成交部分是否满足最小名义价值
+                remaining_volume = round_to(volume_left - order_volume_abs, contract.min_volume)
+                if min_notional > order_price * remaining_volume * 0.5:
+                    return
 
-            # 计算方向相关的volume_left
-            dir_volume_left = volume_left if self.direction == Direction.LONG else -volume_left
-
-            # 情况1：持仓与volume_left方向相反且持仓绝对值大于等于volume_left
-            if (current_pos * dir_volume_left < 0 and abs(current_pos) >= abs(volume_left)):
-                # 直接平仓
+                # 发送普通订单
                 if self.direction == Direction.LONG:
-                    vt_orderid = self.buy(order_price, volume_left, offset=Offset.CLOSE)
+                    vt_orderid = self.buy(order_price, order_volume_abs)
                 else:
-                    vt_orderid = self.sell(order_price, volume_left, offset=Offset.CLOSE)
+                    vt_orderid = self.sell(order_price, order_volume_abs)
+
+                # 记录已发出但未收到回报的订单号
+                if vt_orderid:
+                    self.write_log(f"发送新订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{order_volume_abs}")
+            
+            else:
+                # 获取当前持仓
+                current_pos = self.get_holding()                
+                
+                if (current_pos < 0 if self.direction == Direction.LONG else current_pos > 0) and abs(current_pos) >= volume_left:
+                    # 情况1：持仓与volume_left方向相反且持仓绝对值大于等于volume_left：直接平仓
+                    if self.direction == Direction.LONG:
+                        vt_orderid = self.buy(order_price, volume_left, offset=Offset.CLOSE)
+                    else:
+                        vt_orderid = self.sell(order_price, volume_left, offset=Offset.CLOSE)
+                        
+                    if vt_orderid:
+                        self.write_log(f"发送平仓订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{volume_left}")
+                else:
+                    # 情况2：发送最小的大于等于min_notional的订单，持仓调成反的，下次进入send_new_order就能用平仓单反向平掉多发的量
+                    min_volume = min_notional / order_price
+                    min_volume = round_to(min_volume, contract.min_volume)
+                    if min_volume * order_price < min_notional:  # 确保四舍五入后的volume对应的金额仍然大于等于min_notional
+                        min_volume = round_to(min_volume + contract.min_volume, contract.min_volume)
+                    
+                    if self.direction == Direction.LONG:
+                        vt_orderid = self.buy(order_price, min_volume)
+                    else:
+                        vt_orderid = self.sell(order_price, min_volume)
+                        
+                    if vt_orderid:
+                        self.write_log(f"发送最小名义价值订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{min_volume}")
+                    
+        elif volume_left < 0:
+            # 如果volume_left < 0，说明是之前发送>=min_notional的订单导致的超发：发送反向平仓单
+            current_notional = order_price * order_volume_abs
+            reverse_direction = "空头" if self.direction == Direction.LONG else "多头"
+            if current_notional >= min_notional:
+                # 检查剩余未成交部分是否满足最小名义价值
+                remaining_volume = round_to(volume_left - order_volume_abs, contract.min_volume)
+                if min_notional > order_price * remaining_volume * 0.5:
+                    return
+                
+                # 发送普通订单
+                if self.direction == Direction.LONG:
+                    vt_orderid = self.sell(order_price, abs(volume_left))
+                else:
+                    vt_orderid = self.buy(order_price, abs(volume_left))
 
                 if vt_orderid:
-                    self.pending_orderids.add(vt_orderid)
-                    self.write_log(f"发送平仓订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{volume_left}")
-                return
-                
-            # 情况2：发送最小的大于等于min_notional的订单
-            min_volume = min_notional / order_price
-            min_volume = round_to(min_volume, contract.min_volume)
-            if min_volume * order_price < min_notional:  # 确保四舍五入后的volume对应的金额仍然大于等于min_notional
-                min_volume = round_to(min_volume + contract.min_volume, contract.min_volume)
+                    self.write_log(f"发送反向平仓订单 {vt_orderid}，方向：{reverse_direction}，价格：{order_price}，数量：{abs(volume_left)}")
 
-            if self.direction == Direction.LONG:
-                vt_orderid = self.buy(order_price, min_volume)
             else:
-                vt_orderid = self.sell(order_price, min_volume)
+                # 获取当前持仓
+                current_pos = self.get_holding()
+                if (current_pos < 0 if self.direction == Direction.SHORT else current_pos > 0) and abs(current_pos) >= abs(volume_left):
+                    # 情况1：持仓与volume_left方向相反且持仓绝对值大于等于volume_left：直接平仓
+                    if self.direction == Direction.SHORT:
+                        vt_orderid = self.buy(order_price, abs(volume_left), offset=Offset.CLOSE)
+                    else:
+                        vt_orderid = self.sell(order_price, abs(volume_left), offset=Offset.CLOSE)
+                        
+                    if vt_orderid:
+                        self.write_log(f"发送反向平仓订单 {vt_orderid}，方向：{reverse_direction}，价格：{order_price}，数量：{abs(volume_left)}")
 
-            if vt_orderid:
-                self.pending_orderids.add(vt_orderid)
-                self.write_log(f"发送最小名义价值订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{min_volume}")
-            return
+                else:
+                    # 情况2：发送最小的大于等于min_notional的订单，持仓调成反的，下次进入send_new_order就能用平仓单反向平掉多发的量
+                    min_volume = min_notional / order_price
+                    min_volume = round_to(min_volume, contract.min_volume)
+                    if min_volume * order_price < min_notional:  # 确保四舍五入后的volume对应的金额仍然大于等于min_notional
+                        min_volume = round_to(min_volume + contract.min_volume, contract.min_volume)
 
-        # 检查剩余未成交部分是否满足最小名义价值
-        remaining_volume = round_to(volume_left - order_volume, contract.min_volume)
-        if remaining_volume > 0:
-            remaining_notional = order_price * remaining_volume * 0.5
-            if remaining_notional < min_notional:
-                return
+                    if self.direction == Direction.SHORT:
+                        vt_orderid = self.buy(order_price, min_volume)
+                    else:
+                        vt_orderid = self.sell(order_price, min_volume)
 
-        # 发送普通订单
-        if self.direction == Direction.LONG:
-            vt_orderid = self.buy(order_price, order_volume)
-        else:
-            vt_orderid = self.sell(order_price, order_volume)
+                    if vt_orderid:
+                        self.write_log(f"发送反向平仓订单 {vt_orderid}，方向：{reverse_direction}，价格：{order_price}，数量：{min_volume}")
 
-        # 记录已发出但未收到回报的订单号
         if vt_orderid:
             self.pending_orderids.add(vt_orderid)
-            self.write_log(f"发送新订单 {vt_orderid}，方向：{self.direction}，价格：{order_price}，数量：{order_volume}")
 
     def on_order(self, order: OrderData) -> None:
         """委托回调"""

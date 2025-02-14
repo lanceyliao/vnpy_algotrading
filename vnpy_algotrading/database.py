@@ -1,4 +1,3 @@
-from datetime import datetime
 from peewee import (
     AutoField,
     CharField,
@@ -7,33 +6,8 @@ from peewee import (
     IntegerField,
     Model as ModelBase
 )
-from vnpy.trader.setting import SETTINGS
-from vnpy.trader.utility import load_json
-SETTINGS.update(load_json("vt_setting_local.json"))
 from vnpy_mysql.mysql_database import db
-
-# 算法单状态码
-ALGO_STATUS = {
-    "运行": 1,
-    "暂停": 2,
-    "停止": 3,
-    "结束": 4
-}
-
-# 算法模板代码
-ALGO_TEMPLATE = {
-    "VolumeFollowAlgo": 1,
-    "TwapAlgo": 2,
-    "IcebergAlgo": 3,
-    "SniperAlgo": 4,
-    "StopAlgo": 5,
-    "BestLimitAlgo": 6
-}
-
-# 反向映射
-STATUS_ALGO = {v: k for k, v in ALGO_STATUS.items()}
-TEMPLATE_ALGO = {v: k for k, v in ALGO_TEMPLATE.items()}
-
+from .base import AlgoStatusEnum, AlgoTemplateEnum
 
 class Todo(ModelBase):
     """
@@ -75,10 +49,21 @@ class AlgoOrder(ModelBase):
     volume = FloatField()  # 总量
     traded = FloatField()  # 已成交
     traded_price = FloatField()  # 成交均价
-    status = IntegerField()  # 状态码: 1=RUNNING, 2=PAUSED, 3=STOPPED, 4=FINISHED
-    template = IntegerField()  # 算法模板代码: 1=VolumeFollowAlgo, 2=TwapAlgo, ...
+    status = IntegerField()  # 状态码: ALGO_STATUS.RUNNING, ALGO_STATUS.PAUSED, ...
+    template = IntegerField()  # 算法模板代码: ALGO_TEMPLATE.VolumeFollowAlgo, ALGO_TEMPLATE.TwapAlgo, ...
     start_time = DateTimeField()
     update_time = DateTimeField()
+    
+    def __str__(self) -> str:
+        """格式化输出算法单信息"""        
+        return (
+            f"算法单[todo_id:{self.todo_id}]: {self.vt_symbol}, "
+            f"方向: {self.direction}, 开平: {self.offset}, "
+            f"价格: {self.price}, 数量: {self.volume}, "
+            f"已成交: {self.traded}, 成交均价: {self.traded_price}, "
+            f"状态: {AlgoStatusEnum.to_str(self.status)}, "
+            f"算法: {self.template}"
+        )
     
     class Meta:
         database = db

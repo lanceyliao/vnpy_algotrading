@@ -5,7 +5,7 @@ from vnpy.trader.object import TickData, OrderData, TradeData, ContractData
 from vnpy.trader.constant import OrderType, Offset, Direction
 from vnpy.trader.utility import virtual
 import sys
-from .base import AlgoStatus
+from .base import AlgoStatusEnum
 
 if TYPE_CHECKING:
     from .engine import AlgoEngine
@@ -43,7 +43,7 @@ class AlgoTemplate:
         self.volume: float = volume
         self.todo_id: int = todo_id
 
-        self.status: AlgoStatus = AlgoStatus.PAUSED
+        self.status: AlgoStatusEnum = AlgoStatusEnum.PAUSED
         self.traded: float = 0
         self.traded_price: float = 0
 
@@ -51,7 +51,7 @@ class AlgoTemplate:
 
     def update_tick(self, tick: TickData) -> None:
         """行情数据更新"""
-        if self.status == AlgoStatus.RUNNING:
+        if self.status == AlgoStatusEnum.RUNNING:
             self.on_tick(tick)
 
     def update_order(self, order: OrderData) -> None:
@@ -65,15 +65,37 @@ class AlgoTemplate:
 
     def update_trade(self, trade: TradeData) -> None:
         """成交数据更新"""
-        cost: float = self.traded_price * self.traded + trade.price * trade.volume
-        self.traded += trade.volume
-        self.traded_price = cost / self.traded
+        # 判断成交方向是否与算法方向一致
+        is_reverse = (
+            (self.direction == Direction.LONG and trade.direction == Direction.SHORT) or
+            (self.direction == Direction.SHORT and trade.direction == Direction.LONG)
+        )
+        
+        # 计算成交量，反向成交需要减去
+        volume_change = -trade.volume if is_reverse else trade.volume
+        
+        # 更新成交均价
+        if self.traded == 0:
+            # 第一笔成交，直接使用成交价
+            self.traded_price = trade.price
+        else:
+            # 计算成本和总量
+            old_cost = self.traded_price * self.traded
+            new_cost = trade.price * volume_change
+            
+            # 如果是反向成交，使用净持仓计算均价
+            new_volume = self.traded + volume_change
+            if new_volume != 0:  # 防止除以0
+                self.traded_price = (old_cost + new_cost) / abs(new_volume)
+            
+        # 更新成交量
+        self.traded += volume_change
 
         self.on_trade(trade)
 
     def update_timer(self) -> None:
         """每秒定时更新"""
-        if self.status == AlgoStatus.RUNNING:
+        if self.status == AlgoStatusEnum.RUNNING:
             self.on_timer()
 
     @virtual
@@ -98,40 +120,40 @@ class AlgoTemplate:
 
     def start(self) -> None:
         """启动"""
-        self.status = AlgoStatus.RUNNING
+        self.status = AlgoStatusEnum.RUNNING
         self.put_event()
 
-        self.write_log("算法启动")
+        self.write_log()
 
     def stop(self) -> None:
         """停止"""
-        self.status = AlgoStatus.STOPPED
+        self.status = AlgoStatusEnum.STOPPED
         self.cancel_all()
         self.put_event()
 
-        self.write_log("算法停止")
+        self.write_log()
 
     def finish(self) -> None:
         """结束"""
-        self.status = AlgoStatus.FINISHED
+        self.status = AlgoStatusEnum.FINISHED
         self.cancel_all()
         self.put_event()
 
-        self.write_log("算法结束")
+        self.write_log()
 
     def pause(self) -> None:
         """暂停"""
-        self.status = AlgoStatus.PAUSED
+        self.status = AlgoStatusEnum.PAUSED
         self.put_event()
 
-        self.write_log("算法暂停")
+        self.write_log()
 
     def resume(self) -> None:
         """恢复"""
-        self.status = AlgoStatus.RUNNING
+        self.status = AlgoStatusEnum.RUNNING
         self.put_event()
 
-        self.write_log("算法恢复")
+        self.write_log()
 
     def buy(
         self,
@@ -141,7 +163,7 @@ class AlgoTemplate:
         offset: Offset = Offset.NONE
     ) -> None:
         """买入"""
-        if self.status != AlgoStatus.RUNNING:
+        if self.status != AlgoStatusEnum.RUNNING:
             return
 
         return self.algo_engine.send_order(
@@ -161,7 +183,7 @@ class AlgoTemplate:
         offset: Offset = Offset.NONE
     ) -> None:
         """卖出"""
-        if self.status != AlgoStatus.RUNNING:
+        if self.status != AlgoStatusEnum.RUNNING:
             return
 
         return self.algo_engine.send_order(
@@ -226,13 +248,14 @@ class AlgoTemplate:
         }
         return algo_data
 
-    def write_log(self, msg: str) -> None:
+    def write_log(self, msg: str="") -> None:
         """输出日志"""
-        frame = sys._getframe(1)
-        func_name = frame.f_code.co_name
+        if not msg:
+            msg = AlgoStatusEnum.to_str(self.status)
+        func_name = sys._getframe(1).f_code.co_name
         class_name = self.__class__.__name__
-        formatted_msg = f"[{class_name}.{func_name}] {msg}"
-        self.algo_engine.write_log(formatted_msg, self)
+        formatted_msg = f"[{class_name}.{func_name}] [todo_id:{self.todo_id}] {msg}"
+        self.algo_engine.write_log(formatted_msg, need_format=False)
 
     def put_event(self) -> None:
         """推送更新"""
