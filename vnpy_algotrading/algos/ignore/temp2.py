@@ -1,15 +1,14 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import copy
 
-from vnpy.event import Event
+import requests
 from vnpy.trader.constant import Direction, Offset, Status, OrderType, Exchange
-from vnpy.trader.engine import BaseEngine
 from vnpy.trader.object import TradeData, OrderData, TickData, BarData
+from vnpy.trader.engine import BaseEngine
 from vnpy.trader.utility import round_to
-
-from prod.recorder_engine import OrderErrorData, EVENT_ORDER_ERROR_RECORD
-from ..base import APP_NAME
 from ..template import AlgoTemplate
+from ..base import APP_NAME
 
 
 class VolumeFollowSyncAlgo(AlgoTemplate):
@@ -29,30 +28,31 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
     ]
 
     def __init__(
-        self,
-        algo_engine: BaseEngine,
-        algo_name: str,
-        vt_symbol: str,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        setting: dict,
-        todo_id: int = 0
+            self,
+            algo_engine: BaseEngine,
+            algo_name: str,
+            vt_symbol: str,
+            direction: Direction,
+            offset: Offset,
+            price: float,
+            volume: float,
+            setting: dict,
+            todo_id: int = 0
     ) -> None:
         """构造函数"""
         super().__init__(algo_engine, algo_name, vt_symbol, direction, offset, price, volume, setting, todo_id)
 
         # 参数
         self.price_add_percent: float = setting.get("price_add_percent", self.default_setting["price_add_percent"])
-        self.min_notional_multiplier: float = setting.get("min_notional_multiplier", self.default_setting["min_notional_multiplier"])
+        self.min_notional_multiplier: float = setting.get("min_notional_multiplier",
+                                                          self.default_setting["min_notional_multiplier"])
         self.volume_ratio: float = setting.get("volume_ratio", self.default_setting["volume_ratio"])
         self.max_order_wait: float = setting.get("max_order_wait", self.default_setting["max_order_wait"])
 
         # 变量
         self.tick: TickData = None  # 最新tick数据
         self.tick_volume: float = 0  # 当前tick的成交量
-        self.last_tick_time: datetime = datetime.now()  # 上一次收到tick的时间
+        self.last_tick_time: datetime = None  # 上一次收到tick的时间
 
         # 分钟级数据
         self.current_minute: datetime = None  # 当前分钟时间
@@ -102,8 +102,8 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
 
         # 计算所有订单的待成交量（包括活跃订单和pending订单）
         all_orders = (
-            list(self.active_orders.values()) +
-            list(self.pending_orders.values())
+                list(self.active_orders.values()) +
+                list(self.pending_orders.values())
         )
 
         for order in all_orders:
@@ -125,7 +125,7 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
     def on_tick(self, tick: TickData) -> None:
         """Tick行情回调"""
         # 更新tick时间
-        self.last_tick_time = tick.datetime.replace(tzinfo=None)
+        self.last_tick_time = datetime.now()
 
         # 处理第一个tick
         if self.tick is None:
@@ -149,10 +149,10 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
 
             # 新的一分钟，且只差1分钟
             if (minute_diff == 1
-                and self.last_bar_volume > 0
-                and self.minute_first_ticker_time
-                and self.minute_first_ticker_time.minute == self.current_minute.minute  # 确保是上一分钟的数据
-                and self.minute_first_ticker_time.second <= 5
+                    and self.last_bar_volume > 0
+                    and self.minute_first_ticker_time
+                    and self.minute_first_ticker_time.minute == self.current_minute.minute  # 确保是上一分钟的数据
+                    and self.minute_first_ticker_time.second <= 5
             ):
                 # 只有当上一分钟的第一个ticker是在前5秒内收到时，才使用bar数据修正volume_change
                 minute_volume = self.minute_last_volume - self.minute_first_volume
@@ -189,7 +189,8 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
             else:
                 self.volume_speed = 0  # 如果时间差过小，则速度等于0
 
-            self.write_log(f"当前ticker实际volume：{real_volume_change}，时间差：{time_diff_seconds:.3f}秒，速度：{self.volume_speed:.3f}/秒，未分配量：{self.unallocated_volume}")
+            self.write_log(
+                f"当前ticker实���volume：{real_volume_change}，时间差：{time_diff_seconds:.3f}秒，速度：{self.volume_speed:.3f}/秒，未分配量：{self.unallocated_volume}")
 
         self.tick = tick
 
@@ -199,18 +200,20 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
 
     def on_timer(self) -> None:
         """定时回调"""
-        # 检查tick是否超时
-        if self.last_tick_time:
-            current_time = datetime.now()
-            if (current_time - self.last_tick_time).total_seconds() > 5:
-                self.send_alert(
-                    title="行情数据超时告警",
-                    msg=f"{self.vt_symbol}已超过5秒未收到行情数据"
-                )
-                self.stop()
-
         if not self.tick or not (last_price := self.tick.last_price):
             return
+
+        # 检查tick是否超时
+        if self.tick and self.last_tick_time:
+            current_time = datetime.now()
+            if (current_time - self.last_tick_time).total_seconds() > 5:
+                self.algo_engine.send_alert(
+                    algo=self,
+                    title="行情数据超时告警",
+                    msg=f"{self.vt_symbol}已超过5秒未收到行情数据",
+                    need_phone=False
+                )
+                self.stop()
 
         # 获取合约信息
         contract = self.get_contract()
@@ -299,19 +302,19 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
                 self.order_cancel_time[vt_orderid] = current_time
 
     def add_to_black_hole(self, vt_orderid: str, order: OrderData) -> None:
-        """
-        将订单添加到黑洞订单集合
-        """
+        """将订单添加到黑洞订单集合"""
         if order:
             self.black_hole_orders[vt_orderid] = order
             # 更新黑洞成交量
-            self.black_hole_volume += (order.volume - order.traded)
+            self._black_hole_volume += (order.volume - order.traded)
             self.write_log(f"订单 {vt_orderid} 已移至黑洞订单集合")
 
             # 发送告警并停止算法
-            self.send_alert(
+            self.algo_engine.send_alert(
+                algo=self,
                 title="算法交易撤单超时告警",
-                msg=f"订单 {vt_orderid} 撤单超过2.5秒未收到回报，判定为丢失订单"
+                msg=f"订单 {vt_orderid} 撤单超过2.5秒未收到回报，判定为丢失订单",
+                need_phone=True
             )
 
     def check_cancelled_timeout_orders(self) -> None:
@@ -410,7 +413,7 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
             # 检查当前订单的名义价值
             current_notional = order_price * order_volume_abs
             if current_notional >= min_notional:
-                # 检查剩余未成交部分是否满足最小名义价值
+                # 检查剩��未成交部分是否满足最小名义价值
                 remaining_volume = round_to(volume_left - order_volume_abs, contract.min_volume)
 
                 # 如果剩余量不满足最小名义价值要求，则合并到当前订单中
@@ -425,7 +428,8 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
                     vt_orderid = self.sell(order_price, order_volume_abs)
 
                 if vt_orderid:
-                    self.write_log(f"发送新订单 {vt_orderid}，方向：{order_direction}，价格：{order_price}，数量：{order_volume_abs}")
+                    self.write_log(
+                        f"发送新订单 {vt_orderid}，方向：{order_direction}，价格：{order_price}，数量：{order_volume_abs}")
 
             else:
                 # 直接平仓，错单允许5次
@@ -436,7 +440,8 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
 
                 if vt_orderid:
                     order_offset = Offset.CLOSE
-                    self.write_log(f"发送平仓订单 {vt_orderid}，方向：{order_direction}，价格：{order_price}，数量：{order_volume_abs}")
+                    self.write_log(
+                        f"发送平仓订单 {vt_orderid}，方向：{order_direction}，价格：{order_price}，数量：{order_volume_abs}")
 
         if vt_orderid:
             # 创建OrderData对象
@@ -458,7 +463,8 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
 
     def on_order(self, order: OrderData) -> None:
         """委托回调"""
-        self.write_log(f"收到订单回报 {order.vt_orderid}，状态：{order.status}，已成交：{order.traded}，剩余：{order.volume - order.traded}")
+        self.write_log(
+            f"收到订单回报 {order.vt_orderid}，状态：{order.status}，已成交：{order.traded}，剩余：{order.volume - order.traded}")
 
         # 收到订单回报后，移除已发出订单记录
         if order.vt_orderid in self.pending_orders:
@@ -485,130 +491,34 @@ class VolumeFollowSyncAlgo(AlgoTemplate):
                     error_info = json.loads(rejected_reason) if rejected_reason else {}
                     error_code = int(error_info.get('code', -1))  # 转换为int类型
                     error_msg = error_info.get('msg', '')
-                    order_error = OrderErrorData(
-                        symbol=order.symbol,
-                        exchange=order.exchange,
-                        error_code=error_code,
-                        error_msg=error_msg,
-                        orderid=order.orderid,
-                        todo_id=str(self.todo_id),
-                        create_date=datetime.now(),
-                        gateway_name=order.gateway_name
-                    )
 
-                    self.algo_engine.event_engine.put(Event(EVENT_ORDER_ERROR_RECORD, order_error))
+                    # 处理-1008错误（系统过载）- 允许无限重试
+                    if error_code == -1008:
+                        pass
 
-                    # 初始化错误计数
-                    if error_code not in self.error_counts:
-                        self.error_counts[error_code] = 5
+                    # 处理-2027错误（开仓额超限）- 允许5次，需要���警
+                    elif error_code == -2027:
+                        # 初始化错误计数
+                        if error_code not in self.error_counts:
+                            self.error_counts[error_code] = 5
 
-                    # 减少错误计数
-                    self.error_counts[error_code] -= 1
-                    remaining = self.error_counts[error_code]
-                    self.write_log(f"检测到开仓额超限错误({error_code})，错误信息：{error_msg}，剩余允许次数：{remaining}")
+                        # 减少错误计数
+                        self.error_counts[error_code] -= 1
+                        remaining = self.error_counts[error_code]
+                        self.write_log(
+                            f"检测到开仓额超限错误({error_code})，错误信息：{error_msg}，剩余允许次数：{remaining}")
 
-                    # 当计数减到0时，停止算法并报警
-                    if remaining == 0:
-                        self.can_send_order = False
-                        self.write_log(f"错误({error_code})达到最大允许次数，停止算法执行")
-                        self.stop()
-                        return
+                        # 当计数减到0时，停止算法并报警
+                        if remaining == 0:
+                            self.can_send_order = False
+                            self.write_log(f"错误({error_code})达到最大允许次数，停止算法执行")
+                            self.algo_engine.send_alert(
+                                algo=self,
+                                title="算法交易拒单告警",
+                                msg=f"连续发生拒单，错误代码：{error_code}，错误信息：{error_msg}",
+                                need_phone=False
+                            )
+                            self.stop()
+                            return
 
-                self.put_event()
-
-    def on_trade(self, trade: TradeData) -> None:
-        """成交回调"""
-        self.write_log(f"收到成交回报 {trade.vt_orderid}，价格：{trade.price}，数量：{trade.volume}，方向：{trade.direction}")
-
-        # 如果处于冷却状态且有成交，解除冷却状态
-        if not self.can_send_order:
-            self.can_send_order = True
-            # 重置错误计数器为初始值
-            self.error_counts = {k: 5 for k in self.error_counts.keys()}
-            self.write_log(f"检测到订单成交，解除冷却状态并重置错误计数器")
-
-        # 检查是否所有订单都已完成
-        if self.check_all_finished():
-            self.write_log(f"所有订单已完成，算法执行完成")
-            self.finish()
-        else:
-            self.put_event()
-
-    def check_all_finished(self) -> bool:
-        """
-        检查算法是否完全结束
-        需要满足以下条件：
-        1. 没有活跃订单
-        2. 没有未收到回报的订单
-        3. 没有等待撤单超时的订单
-        4. 已完成预期交易量（包括黑洞成交量）
-        """
-        # 检查是否有活跃订单
-        if self.active_orders:
-            return False
-
-        # 检查是否有未收到回报的订单
-        if self.pending_orders:
-            # 检查是否有等待撤单超时的订单
-            current_time = datetime.now()
-            for vt_orderid in list(self.pending_orders.keys()):
-                if vt_orderid in self.order_cancel_time:
-                    cancel_time = self.order_cancel_time[vt_orderid]
-                    if (current_time - cancel_time).total_seconds() > 2.5:
-                        # 超过2.5秒未收到撤单回报，认为订单已丢失，移至黑洞订单
-                        order = self.pending_orders.pop(vt_orderid)
-                        if vt_orderid in self.active_orders:
-                            order = self.active_orders.pop(vt_orderid)
-                        self.order_cancel_time.pop(vt_orderid)
-
-                        # 添加到黑洞订单集合
-                        self.add_to_black_hole(vt_orderid, order)
-                        continue
-                    return False
-
-            # 如果还有未处理的订单，返回False
-            if self.pending_orders:
-                return False
-
-        # 获取合约信息以处理精度
-        contract = self.get_contract()
-        if not contract:
-            return False
-
-        # 检查是否完成预期交易量（包括黑洞成交量）
-        return round_to(self.traded + self.black_hole_volume - self.volume, contract.min_volume) == 0
-
-    def check_order_volume(self, volume: float) -> bool:
-        """
-        检查订单量是否超过限制
-        """
-        # # 检查正向订单总量限制
-        # if self.sum_forward_volume + volume > self.max_task_volume + 5 * self.min_notional_volume:
-        #     self.write_log(
-        #         f"正向订单总量 {self.sum_forward_volume + volume} 超过限制 {self.max_task_volume + 5 * self.min_notional_volume}")
-        #     self.stop()
-        #     return False
-        #
-        # # 检查正向临时订单总量限制
-        # if self.sum_forward_volume + volume > self.max_temp_volume + 5 * self.min_notional_volume:
-        #     self.write_log(
-        #         f"正向临时订单总量 {self.sum_forward_volume + volume} 超过限制 {self.max_temp_volume + 5 * self.min_notional_volume}")
-        #     self.stop()
-        #     return False
-        return True
-
-    def buy(self, price: float, volume: float, order_type: OrderType = OrderType.LIMIT,
-            offset: Offset = Offset.NONE) -> str:
-        if self.direction == Direction.LONG and self.check_order_volume(volume):
-            self.sum_forward_volume += volume
-            return super().buy(price, volume, order_type, offset)
-        else:
-            return ""
-
-    def sell(self, price: float, volume: float, order_type: OrderType = OrderType.LIMIT,
-             offset: Offset = Offset.NONE) -> str:
-        if self.direction == Direction.SHORT and self.check_order_volume(volume):
-            self.sum_forward_volume += volume
-            return super().sell(price, volume, order_type, offset)
-        else:
-            return ""
+                    # 处理其他错误（如-4164、-2022等）- 允许

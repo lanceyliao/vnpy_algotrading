@@ -1,39 +1,39 @@
-import sys
-from datetime import datetime
 from typing import Optional, TYPE_CHECKING
+import requests
+from datetime import datetime, timedelta
 
-from vnpy.event import Event
-from vnpy.trader.constant import OrderType, Offset, Direction
 from vnpy.trader.engine import BaseEngine
 from vnpy.trader.object import TickData, OrderData, TradeData, ContractData, BarData
+from vnpy.trader.constant import OrderType, Offset, Direction
 from vnpy.trader.utility import virtual
-
-from prod.recorder_engine import OrderErrorData, EVENT_ORDER_ERROR_RECORD
-from .base import AlgoStatusEnum, APP_NAME
+from vnpy.trader.setting import SETTINGS
+import sys
+from .base import AlgoStatusEnum
 
 if TYPE_CHECKING:
     from .engine import AlgoEngine
 
+
 class AlgoTemplate:
     """算法模板"""
 
-    _count: int = 0                 # 实例计数
+    _count: int = 0  # 实例计数
 
-    display_name: str = ""          # 显示名称
-    default_setting: dict = {}      # 默认参数
-    variables: list = []            # 变量名称
+    display_name: str = ""  # 显示名称
+    default_setting: dict = {}  # 默认参数
+    variables: list = []  # 变量名称
 
     def __init__(
-        self,
-        algo_engine: "AlgoEngine",
-        algo_name: str,
-        vt_symbol: str,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        setting: dict,
-        todo_id: int = 0,  # 关联的Todo ID
+            self,
+            algo_engine: "AlgoEngine",
+            algo_name: str,
+            vt_symbol: str,
+            direction: Direction,
+            offset: Offset,
+            price: float,
+            volume: float,
+            setting: dict,
+            todo_id: int = 0  # 关联的Todo ID
     ) -> None:
         """构造函数"""
         self.algo_engine: BaseEngine = algo_engine
@@ -52,9 +52,20 @@ class AlgoTemplate:
 
         # 黑洞订单管理
         self.black_hole_orders: dict[str, OrderData] = {}  # vt_orderid: order，黑洞订单集合
-        self.black_hole_volume: float = 0  # 存储黑洞成交量
 
         self.active_orders: dict[str, OrderData] = {}  # vt_orderid:order
+
+        self._black_hole_volume: float = 0  # 添加这行，用于存储黑洞成交量
+
+    @property
+    def black_hole_volume(self) -> float:
+        """获取黑洞成交量"""
+        return self._black_hole_volume
+
+    @black_hole_volume.setter
+    def black_hole_volume(self, value: float) -> None:
+        """设置黑洞成交量"""
+        self._black_hole_volume = value
 
     def update_tick(self, tick: TickData) -> None:
         """行情数据更新"""
@@ -79,8 +90,8 @@ class AlgoTemplate:
         """成交数据更新"""
         # 判断成交方向是否与算法方向一致
         is_reverse = (
-            (self.direction == Direction.LONG and trade.direction == Direction.SHORT) or
-            (self.direction == Direction.SHORT and trade.direction == Direction.LONG)
+                (self.direction == Direction.LONG and trade.direction == Direction.SHORT) or
+                (self.direction == Direction.SHORT and trade.direction == Direction.LONG)
         )
 
         # 计算成交量，反向成交需要减去
@@ -173,11 +184,11 @@ class AlgoTemplate:
         self.write_log()
 
     def buy(
-        self,
-        price: float,
-        volume: float,
-        order_type: OrderType = OrderType.LIMIT,
-        offset: Offset = Offset.NONE
+            self,
+            price: float,
+            volume: float,
+            order_type: OrderType = OrderType.LIMIT,
+            offset: Offset = Offset.NONE
     ) -> None:
         """买入"""
         if self.status != AlgoStatusEnum.RUNNING:
@@ -193,11 +204,11 @@ class AlgoTemplate:
         )
 
     def sell(
-        self,
-        price: float,
-        volume: float,
-        order_type: OrderType = OrderType.LIMIT,
-        offset: Offset = Offset.NONE
+            self,
+            price: float,
+            volume: float,
+            order_type: OrderType = OrderType.LIMIT,
+            offset: Offset = Offset.NONE
     ) -> None:
         """卖出"""
         if self.status != AlgoStatusEnum.RUNNING:
@@ -266,7 +277,7 @@ class AlgoTemplate:
         }
         return algo_data
 
-    def write_log(self, msg: str="") -> None:
+    def write_log(self, msg: str = "") -> None:
         """输出日志"""
         if not msg:
             msg = AlgoStatusEnum.to_str(self.status)
@@ -323,7 +334,7 @@ class AlgoTemplate:
     def query_lower_leverages(self, current_leverage: int, leverage_brackets: list) -> list[int]:
         """
         获取所有可用的更低杠杆倍数列表
-        
+
         参数:
             current_leverage: 当前杠杆倍数
             leverage_brackets: 杠杆梯度信息列表
@@ -336,26 +347,3 @@ class AlgoTemplate:
 
         self.write_log(f"可选的更低杠杆倍数（从大到小）：{target_leverages}")
         return target_leverages
-
-    def send_alert(self, title: str = "", msg: str = "") -> None:
-        """
-        发送告警并记录到数据库
-
-        Args:
-            title: 告警标题
-            msg: 告警信息
-        """
-        # 创建告警记录
-        alert_error = OrderErrorData(
-            symbol=self.vt_symbol.split(".")[0],
-            exchange=self.get_contract().exchange if self.get_contract() else None,
-            error_code=0,  # 使用0表示告警消息
-            error_msg=f"{title}: {msg}",
-            orderid="",  # 告警不关联订单
-            todo_id=str(self.todo_id),
-            create_date=datetime.now(),
-            gateway_name=APP_NAME
-        )
-
-        # 推送告警事件
-        self.algo_engine.event_engine.put(Event(EVENT_ORDER_ERROR_RECORD, alert_error))
