@@ -1,10 +1,11 @@
 from collections import defaultdict
 from typing import Optional, Type, Set
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
 from queue import Queue
-from vnpy.trader.utility import load_json, save_json, round_to
+import requests
+
 from vnpy.event import EventEngine, Event
 from vnpy.trader.engine import BaseEngine, MainEngine
 from vnpy.trader.event import (
@@ -26,7 +27,10 @@ from vnpy.trader.object import (
     TradeData,
     CancelRequest, BarData
 )
-from vnpy.trader.utility import round_to
+from vnpy.trader.utility import round_to, load_json
+from vnpy.trader.setting import SETTINGS
+
+from prod.barGen_redis_engine import EVENT_BAR
 from .template import AlgoTemplate
 from .base import (
     EVENT_ALGO_LOG,
@@ -39,12 +43,9 @@ from .base import (
 )
 from .converter import PositionManager
 from .database import (
-    AlgoOrder, init_database
+    Todo, AlgoOrder, init_database
 )
 import sys
-from vnpy.usertools.task_db_manager import Todo
-sys.path.append('/opt/external_lib/prod_gateway')
-from  barGen_redis_engine import EVENT_BAR
 
 # 全局映射关系
 DIRECTION_MAP = {
@@ -59,34 +60,18 @@ OFFSET_MAP = {
     "平昨": Offset.CLOSEYESTERDAY
 }
 
-# 默认算法设置
-DEFAULT_ALGO_SETTINGS = {
-    "VolumeFollowAlgo": {
-        "price_add_percent": 2.0,
-        "min_notional_multiplier": 2.0,  # 最小名义价值倍数
-        "volume_ratio": 0.2  # 跟量比例
-    },
-    "VolumeFollowSyncAlgo": {
-        "price_add_percent": 2.0,
-        "min_notional_multiplier": 2.0,  # 最小名义价值倍数
-        "volume_ratio": 0.2,  # 跟量比例
-        "max_order_wait": 2.0  # 最大等待时间
-    },
-    "TwapAlgo": {},
-    "IcebergAlgo": {},
-    "SniperAlgo": {},
-    "StopAlgo": {},
-    "BestLimitAlgo": {}
-}
-
 class AlgoEngine(BaseEngine):
     """算法引擎"""
 
+    # 配置文件名
+    setting_filename: str = "algo_trading_setting.json"
+    
     # 测试配置
     TEST_SYMBOLS = ["ETHUSDT.BINANCE"]  # 测试用的交易对
-    TEST_NOTIONAL_RANGE = (21, 100)     # 测试订单的名义价值范围
+    TEST_NOTIONAL_RANGE = (1, 100)     # 测试订单的名义价值范围
     TEST_PRICE_DIVIDER = 3000           # 用于计算测试订单数量的除数
-    TIMER_INTERVAL = 60                 # 测试订单生成间隔(秒)
+    TIMER_INTERVAL = 30                 # 测试订单生成间隔(秒)
+    ALERT_INTERVAL = 3600               # 告警间隔(秒)
 
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         """构造函数"""
@@ -114,16 +99,18 @@ class AlgoEngine(BaseEngine):
         # 测试相关属性
         self.timer_count: int = 0  # 计时器计数
         self.test_enabled: bool = False  # 是否启用测试订单生成
+
+        # 告警相关属性
+        self.last_phone_alert_time: datetime = None  # 上次电话告警时间
+        
+        # 加载配置
+        self.algo_settings = load_json(self.setting_filename)
+        self.write_log(f"算法交易引擎配置加载完成：\n{self.algo_settings}")
         
         # 加载算法模板
         self.load_algo_template()
         # 注册事件
         self.register_event()
-        
-        spot_filename = "connect_binance_usdt.json"
-        usdt_setting = load_json(spot_filename)
-        self.username = usdt_setting["username"]
-        self.write_log(f"算法交易 user {self.username} version: 20250424")
 
     def start(self, test_enabled: bool = False, allow_multiple_algos: bool = True) -> None:
         """
@@ -259,15 +246,17 @@ class AlgoEngine(BaseEngine):
             todo_id=todo_id,
             status=data["status"],
             traded=data["traded"],
-            traded_price=data["traded_price"]
+            traded_price=data["traded_price"],
+            black_hole_volume=data["black_hole_volume"]
         )
 
-    def update_algo_status(self, todo_id: int, status: int, traded: float = 0, traded_price: float = 0) -> None:
+    def update_algo_status(self, todo_id: int, status: int, traded: float = 0, traded_price: float = 0, black_hole_volume: float = 0) -> None:
         """更新算法单状态"""
         # 更新算法单状态
         AlgoOrder.update(
             traded=traded,
             traded_price=traded_price,
+            black_hole_volume=black_hole_volume,
             status=status,
             update_time=datetime.now()
         ).where(AlgoOrder.todo_id == todo_id).execute()
@@ -277,8 +266,10 @@ class AlgoEngine(BaseEngine):
             # 检查是否完全成交
             algo_order = AlgoOrder.get(AlgoOrder.todo_id == todo_id)
             # completed_status = 11 if algo_order.traded == algo_order.volume else 5
-            if algo_order.traded == algo_order.volume:
+            if algo_order.traded == algo_order.volume and algo_order.black_hole_volume == 0:
                 completed_status = 11
+            elif algo_order.traded + algo_order.black_hole_volume == algo_order.volume:
+                completed_status = 5
             elif status == AlgoStatusEnum.STOPPED:
                 completed_status = 12
             else:
@@ -295,35 +286,54 @@ class AlgoEngine(BaseEngine):
             self.write_log(str(algo_order))
 
     def resume_algo_orders(self) -> None:
-        """恢复未完成的算法单"""
+        """恢复数据库中活动的算法单"""
+        # 获取可设置的恢复时限(小时),默认1小时
+        resume_hours = 1
+
+        # 计算截止时间
+        cutoff_time = datetime.now() - timedelta(hours=resume_hours)
+
+        # 查询数据库中需要恢复的算法单
         running_algos = AlgoOrder.select().where(
-            AlgoOrder.status.in_([AlgoStatusEnum.RUNNING, AlgoStatusEnum.PAUSED])
+            (AlgoOrder.status.in_([
+                AlgoStatusEnum.RUNNING,
+                AlgoStatusEnum.PAUSED
+            ])) &
+            (AlgoOrder.start_time >= cutoff_time)  # 只恢复创建时间在截止时间之后的订单
         )
-        
+
         all_result = True
         for algo_order in running_algos:
             todo = Todo.get_or_none(Todo.id == algo_order.todo_id)
             if not todo:
                 self.write_log(f"找不到对应的Todo记录: {algo_order.todo_id}")
                 continue
-                
+
             # 计算剩余数量
-            volume_left = algo_order.volume - algo_order.traded
+            volume_left = algo_order.volume - algo_order.traded - algo_order.black_hole_volume
             if volume_left == 0:
-                self.update_algo_status(algo_order.todo_id, AlgoStatusEnum.FINISHED, algo_order.traded, algo_order.traded_price)
+                self.update_algo_status(algo_order.todo_id, 
+                AlgoStatusEnum.FINISHED, 
+                algo_order.traded, 
+                algo_order.traded_price,
+                algo_order.black_hole_volume)
                 continue
-                
+
             # 添加到已处理集合
             self.processed_todos.add(algo_order.todo_id)
-            
+
             # 使用新的启动方法
             result = self.start_algo_with_retry(algo_order.todo_id)
-            
+
             if result == -1:  # 启动失败
-                self.update_algo_status(algo_order.todo_id, AlgoStatusEnum.PAUSED)
+                self.update_algo_status(algo_order.todo_id, 
+                                        AlgoStatusEnum.PAUSED,
+                                        algo_order.traded,
+                                        algo_order.traded_price,
+                                        algo_order.black_hole_volume)
                 all_result = False
                 continue
-            
+
             self.write_log(str(algo_order))
 
         self.resume_completed = True
@@ -389,7 +399,7 @@ class AlgoEngine(BaseEngine):
             
             # 获取算法参数
             template_name = AlgoTemplateEnum.to_str(algo_order.template)
-            setting = DEFAULT_ALGO_SETTINGS[template_name]
+            setting = self.algo_settings[template_name]
             
             # 启动算法
             result = self.start_algo(
@@ -402,7 +412,8 @@ class AlgoEngine(BaseEngine):
                 setting=setting,
                 todo_id=todo_id,
                 traded=algo_order.traded,
-                traded_price=algo_order.traded_price
+                traded_price=algo_order.traded_price,
+                black_hole_volume=algo_order.black_hole_volume
             )
             
             if result == -1:
@@ -427,7 +438,6 @@ class AlgoEngine(BaseEngine):
         # 查询新创建的订单
         todos = Todo.select().where(
             (Todo.completed == 10) &  # 新创建的任务
-            (Todo.user == self.username) &  
             (Todo.id.not_in(self.processed_todos))  # 排除已处理的订单
         )
         
@@ -460,6 +470,7 @@ class AlgoEngine(BaseEngine):
                 volume=todo.real_volume,
                 traded=0,
                 traded_price=0,
+                black_hole_volume=0,
                 status=AlgoStatusEnum.RUNNING,
                 # template=AlgoTemplateEnum.VolumeFollowAlgo, # 默认使用跟量算法
                 template=AlgoTemplateEnum.VolumeFollowSyncAlgo,
@@ -533,7 +544,8 @@ class AlgoEngine(BaseEngine):
         setting: dict,
         todo_id: int = 0,
         traded: float = 0,
-        traded_price: float = 0
+        traded_price: float = 0,
+        black_hole_volume: float = 0
     ) -> int:
         """启动算法"""
         contract: Optional[ContractData] = self.main_engine.get_contract(vt_symbol)
@@ -561,6 +573,7 @@ class AlgoEngine(BaseEngine):
         # 设置已成交信息
         algo.traded = traded
         algo.traded_price = traded_price
+        algo.black_hole_volume = black_hole_volume
 
         # 订阅行情
         algos: set = self.symbol_algo_map[algo.vt_symbol]
@@ -776,4 +789,72 @@ class AlgoEngine(BaseEngine):
             f"生成测试订单[todo_id:{todo.id}]: {vt_symbol}, 方向: {direction}, "
             f"价格: {price}, 数量: {volume}, "
         )
+
+    def send_alert(self, algo: AlgoTemplate, title: str = "", msg: str = "", need_phone: bool = False) -> None:
+        """
+        发送告警
+
+        Args:
+            algo: 算法实例
+            title: 告警标题，如果为空则使用默认标题
+            msg: 告警信息，如果为空则使用默认信息
+            need_phone: 是否需要电话告警
+        """
+        # 获取合约信息
+        symbol = algo.vt_symbol.split('.')[0]
+        exchange = algo.vt_symbol.split('.')[1]
+
+        # 设置默认标题和消息
+        if not title:
+            title = "算法交易告警"
+        if not msg:
+            msg = f"合约{symbol}在{exchange}交易所的算法交易发生异常"
+
+        # 构建详细告警内容
+        alert_content = f"""
+            {title}
+
+            todo_id：{algo.todo_id}
+            时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            合约：{symbol}
+            交易所：{exchange}
+            方向：{algo.direction.value}
+            开平：{algo.offset.value}
+            价格：{algo.price}
+            数量：{algo.volume}
+
+            异常信息：{msg}
+        """
+
+        # 检查是否需要发送电话告警
+        push_url = SETTINGS.get("phone.receiver")
+        if need_phone and push_url:
+            current_time = datetime.now()
+            
+            # 检查是否在告警间隔内
+            if not self.last_phone_alert_time or (current_time - self.last_phone_alert_time).total_seconds() >= self.ALERT_INTERVAL:
+                try:
+                    body = {
+                        'title': title,
+                        'content': f'{title}：{msg}',
+                        'channel': 'voice'
+                    }
+                    response = requests.post(push_url, json=body)
+                    if response.status_code == 200:
+                        self.write_log(f"已发送电话告警")
+                        # 更新最后告警时间
+                        self.last_phone_alert_time = current_time
+                    else:
+                        self.write_log(f"电话告警发送失败，状态码：{response.status_code}")
+                except Exception as e:
+                    self.write_log(f"电话告警发送异常：{str(e)}")
+            else:
+                self.write_log(f"告警间隔内({self.ALERT_INTERVAL}秒)已发送过电话告警，本次跳过")
+
+        # 发送邮件告警
+        try:
+            self.main_engine.send_email(title, alert_content)
+            self.write_log(f"已发送邮件告警")
+        except Exception as e:
+            self.write_log(f"邮件告警发送异常：{str(e)}")
 

@@ -6,13 +6,36 @@ from peewee import (
     IntegerField,
     Model as ModelBase
 )
-from peewee import *
-from vnpy.trader.setting import SETTINGS
-from peewee import Model, CharField, IntegerField, AutoField, DateTimeField, TextField, MySQLDatabase, FloatField
-from peewee import __exception_wrapper__
-import datetime
-from vnpy.usertools.task_db_manager import db
+from vnpy_mysql.mysql_database import db
 from .base import AlgoStatusEnum, AlgoTemplateEnum
+
+class Todo(ModelBase):
+    """
+    Index is id 
+    """
+    id = AutoField()
+    content = CharField()  # f"{vt_symbol}_{strategy}"
+    vt_symbol = CharField()
+    direction = CharField()
+    offset = CharField()
+    price = FloatField()
+    signal_volume = FloatField()
+    real_volume = FloatField()
+    level = IntegerField() # 1 为父任务 2 为子任务 此模块中处理的都是 2 级
+    ref = IntegerField()  # 子任务对应的父任务id
+    user = CharField()
+    completed = IntegerField()  # 10任务创建 11任务完成 5任务异常完成
+    datetime = DateTimeField()
+    create_date = DateTimeField()
+    create_by = CharField()
+    remarks = CharField()
+    orderid = CharField()
+    kuo1 = CharField()
+    kuo2 = CharField()
+    
+    class Meta:
+        database = db
+        indexes = ((("content", "vt_symbol", "datetime"), True),)
 
 
 class AlgoOrder(ModelBase):
@@ -26,6 +49,7 @@ class AlgoOrder(ModelBase):
     volume = FloatField()  # 总量
     traded = FloatField()  # 已成交
     traded_price = FloatField()  # 成交均价
+    black_hole_volume = FloatField(default=0)  # 黑洞成交量
     status = IntegerField()  # 状态码: ALGO_STATUS.RUNNING, ALGO_STATUS.PAUSED, ...
     template = IntegerField()  # 算法模板代码: ALGO_TEMPLATE.VolumeFollowAlgo, ALGO_TEMPLATE.TwapAlgo, ...
     start_time = DateTimeField()
@@ -38,6 +62,7 @@ class AlgoOrder(ModelBase):
             f"方向: {self.direction}, 开平: {self.offset}, "
             f"价格: {self.price}, 数量: {self.volume}, "
             f"已成交: {self.traded}, 成交均价: {self.traded_price}, "
+            f"黑洞成交量: {self.black_hole_volume}, "
             f"状态: {AlgoStatusEnum.to_str(self.status)}, "
             f"算法: {self.template}"
         )
@@ -52,4 +77,4 @@ class AlgoOrder(ModelBase):
 
 def init_database() -> None:
     """初始化数据库"""
-    db.create_tables([AlgoOrder], safe=True)
+    db.create_tables([Todo, AlgoOrder], safe=True)

@@ -1,11 +1,16 @@
 from typing import Optional, TYPE_CHECKING
+import requests
+from datetime import datetime, timedelta
 
+from vnpy.event import Event
 from vnpy.trader.engine import BaseEngine
 from vnpy.trader.object import TickData, OrderData, TradeData, ContractData, BarData
 from vnpy.trader.constant import OrderType, Offset, Direction
 from vnpy.trader.utility import virtual
+from vnpy.trader.setting import SETTINGS
 import sys
-from .base import AlgoStatusEnum
+from .base import AlgoStatusEnum, APP_NAME
+from prod.recorder_engine import OrderErrorData, EVENT_ORDER_ERROR_RECORD
 
 if TYPE_CHECKING:
     from .engine import AlgoEngine
@@ -30,7 +35,7 @@ class AlgoTemplate:
         price: float,
         volume: float,
         setting: dict,
-        todo_id: int = 0  # 关联的Todo ID
+        todo_id: int = 0,  # 关联的Todo ID
     ) -> None:
         """构造函数"""
         self.algo_engine: BaseEngine = algo_engine
@@ -46,8 +51,17 @@ class AlgoTemplate:
         self.status: AlgoStatusEnum = AlgoStatusEnum.PAUSED
         self.traded: float = 0
         self.traded_price: float = 0
+        
+        # 黑洞订单管理
+        self.black_hole_orders: dict[str, OrderData] = {}  # vt_orderid: order，黑洞订单集合
+        self.black_hole_volume: float = 0  # 存储黑洞成交量
+
+        # 添加告警缓存
+        self._alert_cache = {}  # 用于存储最近的告警 {title: timestamp}
+        self._alert_cache_timeout = 300  # 缓存超时时间(秒)
 
         self.active_orders: dict[str, OrderData] = {}  # vt_orderid:order
+
 
     def update_tick(self, tick: TickData) -> None:
         """行情数据更新"""
@@ -250,8 +264,9 @@ class AlgoTemplate:
             "volume": self.volume,
             "status": self.status,
             "traded": self.traded,
-            "left": self.volume - self.traded,
+            "left": self.volume - self.traded - self.black_hole_volume,
             "traded_price": self.traded_price,
+            "black_hole_volume": self.black_hole_volume,
             "parameters": self.get_parameters(),
             "variables": self.get_variables(),
             "todo_id": self.todo_id
@@ -275,3 +290,95 @@ class AlgoTemplate:
     def get_holding(self) -> float:
         """获取当前持仓"""
         return self.algo_engine.get_holding(self.vt_symbol)
+    
+    def query_leverage(self) -> None:
+        """查询杠杆"""
+        contract: ContractData = self.get_contract()
+        if contract:
+            gateway_name = contract.gateway_name
+            gateway = self.algo_engine.main_engine.get_gateway(gateway_name)
+            if gateway:
+                gateway.rest_api.query_symbol_config()
+    
+    def get_leverage(self) -> int:
+        """获取杠杆倍数"""
+        contract: ContractData = self.get_contract()
+        if contract and contract.extra:
+            gateway_name = contract.gateway_name
+            if "leverage" in contract.extra and gateway_name in contract.extra["leverage"]:
+                current_leverage = int(contract.extra["leverage"][gateway_name])
+                return current_leverage
+        return 0
+    
+    def query_leverage_bracket(self) -> None:
+        """查询杠杆梯度"""
+        contract: ContractData = self.get_contract()
+        if contract:
+            gateway_name = contract.gateway_name
+            gateway = self.algo_engine.main_engine.get_gateway(gateway_name)
+            if gateway:
+                gateway.rest_api.query_leverage_bracket()
+
+    def get_leverage_bracket(self) -> list[int]:
+        """获取杠杆梯度"""
+        contract: ContractData = self.get_contract()
+        if contract and contract.extra and "leverage_brackets" in contract.extra:
+            leverage_brackets = contract.extra["leverage_brackets"]
+            return leverage_brackets
+        return []
+    
+    def query_lower_leverages(self, current_leverage: int, leverage_brackets: list) -> list[int]:
+        """
+        获取所有可用的更低杠杆倍数列表
+        
+        参数:
+            current_leverage: 当前杠杆倍数
+            leverage_brackets: 杠杆梯度信息列表
+        """
+        # 获取所有可用的杠杆倍数
+        leverages = [b.get("initialLeverage", 0) for b in leverage_brackets if b.get("initialLeverage", 0) > 0]
+        
+        # 筛选并排序更低的杠杆倍数
+        target_leverages = sorted([lev for lev in leverages if lev < current_leverage], reverse=True)
+        
+        self.write_log(f"可选的更低杠杆倍数（从大到小）：{target_leverages}")
+        return target_leverages
+
+    def send_alert(self, title: str = "", msg: str = "", need_phone: bool = False, need_db: bool = False) -> None:
+        """
+        发送告警并记录到数据库，相同标题的告警会在缓存期内被去重
+
+        Args:
+            title: 告警标题
+            msg: 告警信息
+            need_phone: 是否需要电话告警
+        """
+        current_time = datetime.now()
+
+        # 检查是否存在相同标题的近期告警
+        if title in self._alert_cache:
+            last_alert_time = self._alert_cache[title]
+            if (current_time - last_alert_time).total_seconds() < self._alert_cache_timeout:
+                return
+
+        # 更新告警缓存
+        self._alert_cache[title] = current_time
+
+        # 如果相同标题的告警在缓存期内，不发送告警记录数据库
+        self.algo_engine.send_alert(self, title=title, msg=msg, need_phone=need_phone)
+
+        if not need_db:
+            # 创建告警记录
+            alert_error = OrderErrorData(
+                symbol=self.vt_symbol,
+                exchange=self.get_contract().exchange if self.get_contract() else None,
+                error_code=0,  # 使用0表示告警消息
+                error_msg=f"{title}: {msg}",
+                orderid="",  # 告警不关联订单
+                todo_id=str(self.todo_id),
+                create_date=current_time,
+                gateway_name=APP_NAME
+            )
+
+            # 推送告警事件
+            self.algo_engine.event_engine.put(Event(EVENT_ORDER_ERROR_RECORD, alert_error))
