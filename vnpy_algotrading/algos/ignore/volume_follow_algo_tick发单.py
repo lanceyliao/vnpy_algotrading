@@ -54,14 +54,21 @@ class VolumeFollowAlgo(AlgoTemplate):
         
         # 拆单相关变量
         self.last_ticker_time: datetime = None  # 上一次volume发生变化的时间（ticker推送）
-        self.volume_speed: float = 0  # 当前的成交速度(volume/秒)
-        self.unallocated_volume: float = 0  # 未分配的累积real_volume_change
+        self.last_volume_split_time: datetime = None  # 上一次分配volume的时间
+        self.split_volume: float = 0  # 每次分配的volume
+        self.split_count: int = 0  # 需要分配的总次数
+        self.allocated_count: int = 0  # 已分配的次数
         
         # 订单管理
+        self.cancel_orderids: set = set()  # 等待撤单委托号集合
         self.pending_orderids: set = set()  # 已发出但未收到回报的订单号集合
-        self.order_cancel_time: dict = {}  # 记录订单的撤单时间，键为vt_orderid，值为撤单发出时间
+        self.order_cancel_time: dict = {}  # 记录pending订单的撤单时间
 
         self.put_event()
+
+    def on_timer(self) -> None:
+        """定时回调"""
+        pass
 
     def on_tick(self, tick: TickData) -> None:
         """Tick行情回调"""
@@ -112,100 +119,96 @@ class VolumeFollowAlgo(AlgoTemplate):
         # 根据是否有实际volume变化来处理
         if real_volume_change > 0:
             self.write_log(f"检测到volume变化：{real_volume_change}")
-            
+            # 获取合约信息
+            contract = self.get_contract()
+            if not contract:
+                self.write_log("获取合约信息失败")
+                return
+                
+            # 获取最小名义价值
+            min_notional = contract.extra.get("min_notional", 0)
+            if not min_notional:
+                self.write_log("获取最小名义价值失败")
+                return
+
             # 计算ticker之间的时间差
             ticker_time_diff = tick.datetime - self.last_ticker_time
             self.last_ticker_time = tick.datetime
+            
+            # 重置计数器
+            self.allocated_count = 0
 
-            # 累加未分配的volume
-            self.unallocated_volume += real_volume_change
+            # 计算需要分配的次数
+            time_based_count = max(1, int(ticker_time_diff.total_seconds() / 0.5))  # 修改：确保至少1次
             
-            # 计算成交速度
-            time_diff_seconds = ticker_time_diff.total_seconds()
-            if time_diff_seconds > 0.5:
-                self.volume_speed = self.unallocated_volume / time_diff_seconds
+            # 计算基于最小名义价值的最大拆分次数
+            notional_value = real_volume_change * tick.last_price
+            min_split_notional = min_notional * self.min_notional_multiplier / self.volume_ratio
+            max_splits = max(1, int(notional_value / min_split_notional))  # 修改：确保至少1次
+            
+            # 取两者的较小值作为实际拆分次数
+            self.split_count = min(time_based_count, max_splits)
+            
+            # 计算每次分配的volume
+            self.split_volume = real_volume_change / self.split_count
+            
+            # 分配当前ticker的volume
+            self.tick_volume = self.split_volume
+            self.write_log(f"当前ticker实际volume：{real_volume_change}，时间拆分{time_based_count}次，价值拆分{max_splits}次，实际拆分{self.split_count}次，每次分配volume：{self.split_volume}")
+            self.allocated_count += 1
+            self.last_volume_split_time = tick.localtime
+            
+        elif real_volume_change == 0:
+            # depth推送，计算距离上次分配的时间差
+            if self.last_volume_split_time and self.allocated_count < self.split_count:
+                time_since_last_split = tick.localtime - self.last_volume_split_time
+                
+                # 如果距离上次分配超过0.5秒，分配一次volume
+                if time_since_last_split.total_seconds() >= 0.5:
+                    self.tick_volume = self.split_volume
+                    self.allocated_count += 1
+                    self.last_volume_split_time = tick.localtime
+                    self.write_log(f"距上次分配{time_since_last_split.total_seconds():.3f}秒，分配volume：{self.split_volume}，已分配{self.allocated_count}/{self.split_count}次")
+                else:
+                    self.tick_volume = 0
             else:
-                self.volume_speed = 0  # 如果时间差过小，则速度等于0
-            
-            self.write_log(f"当前ticker实际volume：{real_volume_change}，时间差：{time_diff_seconds:.3f}秒，速度：{self.volume_speed:.3f}/秒，未分配量：{self.unallocated_volume}")
+                self.tick_volume = 0
+        else:
+            self.tick_volume = 0
                 
         self.tick = tick
+
+        # 如果没有最新成交量，则返回
+        if self.tick_volume <= 0:
+            return
+
+        # 检查是否有需要清理的超时撤单订单
+        self.check_cancelled_timeout_orders()
+
+        # 执行委托
+        self.trade()
 
     def on_bar(self, bar: BarData) -> None:
         """K线数据更新"""
         self.last_bar_volume = bar.volume
 
-    def on_timer(self) -> None:
-        """定时回调"""
-        if not self.tick or not (last_price := self.tick.last_price):
-            return
-            
-        # 获取合约信息
-        contract = self.get_contract()
-        if not contract:
-            return
-            
-        # 获取最小名义价值
-        min_notional = contract.extra.get("min_notional", 0)
-        if not min_notional:
-            return
-            
-        # 计算最小名义价值要求
-        min_notional_required = min_notional * self.min_notional_multiplier / self.volume_ratio
-        
-        # 计算最小需要分配的量
-        min_volume = min_notional_required / last_price
-        
-        # 基于速度计算的分配量
-        speed_volume = self.volume_speed * 0.5  # 0.5秒的量
-        
-        # 分配量计算逻辑：
-        # 1. 如果未分配量小于最小量要求，则全部分配出去（避免剩余小单）
-        # 2. 否则，在以下三个值中取最合适的：
-        #    - speed_volume: 基于当前0.5秒的成交速度计算的量
-        #    - min_volume: 基于最小名义价值计算的最小量（作为下限）
-        #    - unallocated_volume: 当前未分配的累积量（作为上限）
-        self.tick_volume = (
-            self.unallocated_volume if self.unallocated_volume <= min_volume
-            else min(max(speed_volume, min_volume), self.unallocated_volume)
-        )
-            
-        # 检查是否有需要清理的超时撤单订单
-        self.check_cancelled_timeout_orders()
-
-        # 如果有分配的量，执行委托
-        if self.tick_volume > 0:
-            # 执行委托
-            self.trade()
-        else:
-            # self.write_log(f"量：{self.tick_volume}，不执行委托")
-            pass
-
     def check_cancelled_timeout_orders(self) -> None:
         """检查超时的撤单订单"""
-        current_time = datetime.now()
-        
-        # 检查所有需要撤单的订单
-        for vt_orderid in list(self.order_cancel_time.keys()):
+        for vt_orderid in list(self.pending_orderids):
+            if vt_orderid not in self.order_cancel_time:
+                continue
+                
             cancel_time = self.order_cancel_time[vt_orderid]
-            if (current_time - cancel_time).total_seconds() > 10:
+            if (datetime.now() - cancel_time).total_seconds() > 10:
                 self.write_log(f"订单 {vt_orderid} 撤单超过10秒未收到回报，判定为丢失订单")
-                # 从各种集合中移除
-                if vt_orderid in self.pending_orderids:
-                    self.pending_orderids.remove(vt_orderid)
-                if vt_orderid in self.active_orders:
-                    self.active_orders.pop(vt_orderid)
-                if vt_orderid in self.order_cancel_time:
-                    self.order_cancel_time.pop(vt_orderid)
+                self.pending_orderids.remove(vt_orderid)
+                self.order_cancel_time.pop(vt_orderid)
 
     def trade(self) -> None:
         """执行委托"""
         if not self.check_order_finished():
-            self.write_log(f"撤销旧委托，不发新单")
             self.cancel_old_order()
         else:
-            self.write_log(f"执行委托，分配：{self.tick_volume}")
-            self.unallocated_volume = max(self.unallocated_volume - self.tick_volume, 0)
             self.send_new_order()
 
     def check_order_finished(self) -> bool:
@@ -217,12 +220,18 @@ class VolumeFollowAlgo(AlgoTemplate):
 
     def cancel_old_order(self) -> None:
         """撤销旧委托"""
-        # 合并撤销活跃订单和未收到回报的订单
-        all_orderids = list(self.active_orders.keys()) + list(self.pending_orderids)
-        for vt_orderid in all_orderids:
-            if vt_orderid not in self.order_cancel_time:  # 只撤销未撤过的订单
+        # 撤销活跃订单
+        for vt_orderid in self.active_orders:
+            if vt_orderid not in self.cancel_orderids:
                 self.cancel_order(vt_orderid)
-                self.order_cancel_time[vt_orderid] = datetime.now()
+                self.cancel_orderids.add(vt_orderid)
+
+        # 撤销未收到回报的订单
+        for vt_orderid in self.pending_orderids:
+            if vt_orderid not in self.cancel_orderids:
+                self.cancel_order(vt_orderid)
+                self.cancel_orderids.add(vt_orderid)
+                self.order_cancel_time[vt_orderid] = datetime.now()  # 只记录pending订单的撤单时间
 
     def send_new_order(self) -> None:
         """发送新委托"""
@@ -375,13 +384,14 @@ class VolumeFollowAlgo(AlgoTemplate):
         # 收到订单回报后，移除已发出订单记录
         if order.vt_orderid in self.pending_orderids:
             self.pending_orderids.remove(order.vt_orderid)
-            
-        # 无论什么情况都从order_cancel_time中移除
-        if order.vt_orderid in self.order_cancel_time:
-            self.order_cancel_time.pop(order.vt_orderid)
-            self.write_log(f"订单 {order.vt_orderid} 已从撤单监控中移除")
+            if order.vt_orderid in self.order_cancel_time:
+                self.order_cancel_time.pop(order.vt_orderid)
+                self.write_log(f"订单 {order.vt_orderid} 已从撤单超时监控中移除")
             
         if not order.is_active():
+            if order.vt_orderid in self.cancel_orderids:
+                self.cancel_orderids.remove(order.vt_orderid)
+                self.write_log(f"订单 {order.vt_orderid} 已从撤单集合中移除")
             self.put_event()
 
     def on_trade(self, trade: TradeData) -> None:

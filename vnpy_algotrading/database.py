@@ -6,36 +6,13 @@ from peewee import (
     IntegerField,
     Model as ModelBase
 )
-from vnpy_mysql.mysql_database import db
+from peewee import *
+from vnpy.trader.setting import SETTINGS
+from peewee import Model, CharField, IntegerField, AutoField, DateTimeField, TextField, MySQLDatabase, FloatField
+from peewee import __exception_wrapper__
+import datetime
+from vnpy.usertools.task_db_manager import db
 from .base import AlgoStatusEnum, AlgoTemplateEnum
-
-class Todo(ModelBase):
-    """
-    Index is id 
-    """
-    id = AutoField()
-    content = CharField()  # f"{vt_symbol}_{strategy}"
-    vt_symbol = CharField()
-    direction = CharField()
-    offset = CharField()
-    price = FloatField()
-    signal_volume = FloatField()
-    real_volume = FloatField()
-    level = IntegerField()
-    ref = IntegerField()  # 子任务对应的父任务id
-    user = CharField()
-    completed = IntegerField()  # 10任务创建 11任务完成 5任务异常完成
-    datetime = DateTimeField()
-    create_date = DateTimeField()
-    create_by = CharField()
-    remarks = CharField()
-    orderid = CharField()
-    kuo1 = CharField()
-    kuo2 = CharField()
-    
-    class Meta:
-        database = db
-        indexes = ((("content", "vt_symbol", "datetime"), True),)
 
 
 class AlgoOrder(ModelBase):
@@ -75,4 +52,4 @@ class AlgoOrder(ModelBase):
 
 def init_database() -> None:
     """初始化数据库"""
-    db.create_tables([Todo, AlgoOrder], safe=True)
+    db.create_tables([AlgoOrder], safe=True)

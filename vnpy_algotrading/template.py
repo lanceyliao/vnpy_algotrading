@@ -1,7 +1,7 @@
 from typing import Optional, TYPE_CHECKING
 
 from vnpy.trader.engine import BaseEngine
-from vnpy.trader.object import TickData, OrderData, TradeData, ContractData
+from vnpy.trader.object import TickData, OrderData, TradeData, ContractData, BarData
 from vnpy.trader.constant import OrderType, Offset, Direction
 from vnpy.trader.utility import virtual
 import sys
@@ -54,6 +54,11 @@ class AlgoTemplate:
         if self.status == AlgoStatusEnum.RUNNING:
             self.on_tick(tick)
 
+    def update_bar(self, bar: BarData) -> None:
+        """K线数据更新"""
+        if self.status == AlgoStatusEnum.RUNNING:
+            self.on_bar(bar)
+
     def update_order(self, order: OrderData) -> None:
         """委托数据更新"""
         if order.is_active():
@@ -101,6 +106,11 @@ class AlgoTemplate:
     @virtual
     def on_tick(self, tick: TickData) -> None:
         """行情回调"""
+        pass
+
+    @virtual
+    def on_bar(self, bar: BarData) -> None:
+        """K线回调"""
         pass
 
     @virtual

@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 import random
 from queue import Queue
-
+from vnpy.trader.utility import load_json, save_json, round_to
 from vnpy.event import EventEngine, Event
 from vnpy.trader.engine import BaseEngine, MainEngine
 from vnpy.trader.event import (
@@ -15,6 +15,7 @@ from vnpy.trader.event import (
     EVENT_CONTRACT
 )
 from vnpy.trader.constant import Direction, Offset, OrderType, Exchange
+from vnpy.trader.gateway import BaseGateway
 from vnpy.trader.object import (
     SubscribeRequest,
     OrderRequest,
@@ -23,10 +24,9 @@ from vnpy.trader.object import (
     OrderData,
     TickData,
     TradeData,
-    CancelRequest
+    CancelRequest, BarData
 )
 from vnpy.trader.utility import round_to
-
 from .template import AlgoTemplate
 from .base import (
     EVENT_ALGO_LOG,
@@ -39,9 +39,12 @@ from .base import (
 )
 from .converter import PositionManager
 from .database import (
-    Todo, AlgoOrder, init_database
+    AlgoOrder, init_database
 )
 import sys
+from vnpy.usertools.task_db_manager import Todo
+sys.path.append('/opt/external_lib/prod_gateway')
+from  barGen_redis_engine import EVENT_BAR
 
 # 全局映射关系
 DIRECTION_MAP = {
@@ -58,7 +61,17 @@ OFFSET_MAP = {
 
 # 默认算法设置
 DEFAULT_ALGO_SETTINGS = {
-    "VolumeFollowAlgo": {"price_add_percent": 2.0},
+    "VolumeFollowAlgo": {
+        "price_add_percent": 2.0,
+        "min_notional_multiplier": 2.0,  # 最小名义价值倍数
+        "volume_ratio": 0.2  # 跟量比例
+    },
+    "VolumeFollowSyncAlgo": {
+        "price_add_percent": 2.0,
+        "min_notional_multiplier": 2.0,  # 最小名义价值倍数
+        "volume_ratio": 0.2,  # 跟量比例
+        "max_order_wait": 2.0  # 最大等待时间
+    },
     "TwapAlgo": {},
     "IcebergAlgo": {},
     "SniperAlgo": {},
@@ -73,7 +86,7 @@ class AlgoEngine(BaseEngine):
     TEST_SYMBOLS = ["ETHUSDT.BINANCE"]  # 测试用的交易对
     TEST_NOTIONAL_RANGE = (21, 100)     # 测试订单的名义价值范围
     TEST_PRICE_DIVIDER = 3000           # 用于计算测试订单数量的除数
-    TIMER_INTERVAL = 50                 # 测试订单生成间隔(秒)
+    TIMER_INTERVAL = 60                 # 测试订单生成间隔(秒)
 
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         """构造函数"""
@@ -92,7 +105,7 @@ class AlgoEngine(BaseEngine):
         self.resume_completed: bool = False  # 标记恢复过程是否完成
         
         # 合约就绪状态和待启动队列
-        self.contract_ready: dict[str, bool] = defaultdict(bool)  # vt_symbol: ready
+        self.contract_ready: dict[str, bool] = {}
         self.start_requests: dict[str, set[int]] = defaultdict(set)  # vt_symbol: set[todo_id]
         
         # 配置参数
@@ -106,6 +119,11 @@ class AlgoEngine(BaseEngine):
         self.load_algo_template()
         # 注册事件
         self.register_event()
+        
+        spot_filename = "connect_binance_usdt.json"
+        usdt_setting = load_json(spot_filename)
+        self.username = usdt_setting["username"]
+        self.write_log(f"算法交易 user {self.username} version: 20250424")
 
     def start(self, test_enabled: bool = False, allow_multiple_algos: bool = True) -> None:
         """
@@ -144,6 +162,7 @@ class AlgoEngine(BaseEngine):
         from .algos.stop_algo import StopAlgo
         from .algos.best_limit_algo import BestLimitAlgo
         from .algos.volume_follow_algo import VolumeFollowAlgo
+        from .algos.volume_follow_sync_algo import VolumeFollowSyncAlgo
 
         self.add_algo_template(TwapAlgo)
         self.add_algo_template(IcebergAlgo)
@@ -151,6 +170,7 @@ class AlgoEngine(BaseEngine):
         self.add_algo_template(StopAlgo)
         self.add_algo_template(BestLimitAlgo)
         self.add_algo_template(VolumeFollowAlgo)
+        self.add_algo_template(VolumeFollowSyncAlgo)
 
     def add_algo_template(self, template: AlgoTemplate) -> None:
         """添加算法类"""
@@ -163,6 +183,7 @@ class AlgoEngine(BaseEngine):
     def register_event(self) -> None:
         """注册事件监听"""
         self.event_engine.register(EVENT_TICK, self.process_tick_event)
+        self.event_engine.register(EVENT_BAR, self.process_bar_event)
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
         self.event_engine.register(EVENT_ORDER, self.process_order_event)
         self.event_engine.register(EVENT_TRADE, self.process_trade_event)
@@ -176,6 +197,14 @@ class AlgoEngine(BaseEngine):
 
         for algo in algos:
             algo.update_tick(tick)
+
+    def process_bar_event(self, event: Event) -> None:
+        """处理K线事件"""
+        bar: BarData = event.data
+        algos: set[AlgoTemplate] = self.symbol_algo_map[bar.vt_symbol]
+
+        for algo in algos:
+            algo.update_bar(bar)
 
     def process_timer_event(self, event: Event) -> None:
         """处理定时事件"""
@@ -247,7 +276,13 @@ class AlgoEngine(BaseEngine):
         if is_finished(status):
             # 检查是否完全成交
             algo_order = AlgoOrder.get(AlgoOrder.todo_id == todo_id)
-            completed_status = 11 if algo_order.traded == algo_order.volume else 5
+            # completed_status = 11 if algo_order.traded == algo_order.volume else 5
+            if algo_order.traded == algo_order.volume:
+                completed_status = 11
+            elif status == AlgoStatusEnum.STOPPED:
+                completed_status = 12
+            else:
+                completed_status = 5
             
             Todo.update(
                 completed=completed_status
@@ -265,6 +300,7 @@ class AlgoEngine(BaseEngine):
             AlgoOrder.status.in_([AlgoStatusEnum.RUNNING, AlgoStatusEnum.PAUSED])
         )
         
+        all_result = True
         for algo_order in running_algos:
             todo = Todo.get_or_none(Todo.id == algo_order.todo_id)
             if not todo:
@@ -285,6 +321,7 @@ class AlgoEngine(BaseEngine):
             
             if result == -1:  # 启动失败
                 self.update_algo_status(algo_order.todo_id, AlgoStatusEnum.PAUSED)
+                all_result = False
                 continue
             
             self.write_log(str(algo_order))
@@ -292,20 +329,38 @@ class AlgoEngine(BaseEngine):
         self.resume_completed = True
         self.write_log("恢复算法单完成")
 
+        if not all_result:
+            self.query_contract()
+
+    def query_contract(self) -> None:
+        """查询合约"""
+        try:
+            self.main_engine.get_gateway("BINANCE_LINEAR").rest_api.query_contract()
+        except Exception as e:
+            try:
+                gateway: BaseGateway = list(self.main_engine.gateways.values())[0]
+                gateway.rest_api.query_contract()
+            except Exception as e:
+                self.write_log(f"查询合约失败：{e}")
+
     def process_contract_event(self, event: Event) -> None:
         """处理合约事件"""
         contract = event.data
         vt_symbol = contract.vt_symbol
         
         # 标记合约就绪
-        if not self.contract_ready[vt_symbol]:
+        if not self.contract_ready.get(vt_symbol, False):
             self.contract_ready[vt_symbol] = True
+            # 如果是测试，且是被测试合约，记录日志
+            if self.test_enabled and vt_symbol in self.TEST_SYMBOLS:
+                self.write_log(f"合约就绪: {vt_symbol}, 处理该合约的所有待启动算法")
             
             # 处理该合约的所有待启动算法
             todo_ids = self.start_requests[vt_symbol]
             for todo_id in list(todo_ids):  # 使用list创建副本进行遍历
                 result = self.start_algo_with_retry(todo_id)
                 if result == -1:
+                    self.query_contract()
                     break
 
     def start_algo_with_retry(
@@ -327,7 +382,7 @@ class AlgoEngine(BaseEngine):
         self.start_requests[algo_order.vt_symbol].add(todo_id)
         
         # 如果合约已就绪，立即尝试启动
-        if self.contract_ready[algo_order.vt_symbol]:
+        if self.contract_ready.get(algo_order.vt_symbol, False):
             # 转换方向和开平
             direction = DIRECTION_MAP.get(algo_order.direction, Direction.NET)
             offset = OFFSET_MAP.get(algo_order.offset, Offset.NONE)
@@ -353,14 +408,15 @@ class AlgoEngine(BaseEngine):
             if result == -1:
                 # 启动失败，保持在集合中并关闭合约就绪状态
                 self.contract_ready[algo_order.vt_symbol] = False
-                self.write_log(f"算法启动失败，保持在等待集合中：{algo_order.vt_symbol}")
+                self.write_log(f"合约未就绪：{algo_order.vt_symbol}，算法启动失败")
                 return -1
             
             # 启动成功，从集合中移除
             self.start_requests[algo_order.vt_symbol].remove(todo_id)
             return result
-                
-        return 0  # 表示已加入集合等待启动
+        else:
+            self.write_log(f"合约未就绪，保持在等待集合中：{algo_order.vt_symbol}")
+            return -1
 
     def process_todo_orders(self) -> None:
         """处理待执行订单"""
@@ -371,9 +427,11 @@ class AlgoEngine(BaseEngine):
         # 查询新创建的订单
         todos = Todo.select().where(
             (Todo.completed == 10) &  # 新创建的任务
+            (Todo.user == self.username) &  
             (Todo.id.not_in(self.processed_todos))  # 排除已处理的订单
         )
         
+        all_result = True
         for todo in todos:
             # 标记为已处理
             self.processed_todos.add(todo.id)
@@ -403,7 +461,8 @@ class AlgoEngine(BaseEngine):
                 traded=0,
                 traded_price=0,
                 status=AlgoStatusEnum.RUNNING,
-                template=1, # 默认使用跟量算法
+                # template=AlgoTemplateEnum.VolumeFollowAlgo, # 默认使用跟量算法
+                template=AlgoTemplateEnum.VolumeFollowSyncAlgo,
                 start_time=datetime.now(),
                 update_time=datetime.now()
             )
@@ -419,11 +478,15 @@ class AlgoEngine(BaseEngine):
                     status=AlgoStatusEnum.PAUSED,
                     update_time=datetime.now()
                 ).where(AlgoOrder.todo_id == todo.id).execute()
+                all_result = False
                 continue
             
             # 获取最新的算法单信息
             algo_order = AlgoOrder.get(AlgoOrder.todo_id == todo.id)
             self.write_log(str(algo_order))
+
+        if not all_result:
+            self.query_contract()
 
     def stop_all(self) -> None:
         """停止全部算法"""
@@ -537,6 +600,19 @@ class AlgoEngine(BaseEngine):
         )
         self.main_engine.subscribe(req, gateway_name)
 
+    def unsubscribe(self, symbol: str, exchange: Exchange, gateway_name: str) -> None:
+        """退订行情"""
+        req: SubscribeRequest = SubscribeRequest(
+            symbol=symbol,
+            exchange=exchange
+        )
+        if not hasattr(self.main_engine, "unsubscribe"):
+            gateway: BaseGateway = self.main_engine.get_gateway(gateway_name)
+            if gateway:
+                gateway.unsubscribe(req)
+        else:
+            self.main_engine.unsubscribe(req, gateway_name)
+
     def send_order(
         self,
         algo: AlgoTemplate,
@@ -627,9 +703,16 @@ class AlgoEngine(BaseEngine):
         ):
             self.algos.pop(algo.todo_id)
 
-            for algos in self.symbol_algo_map.values():
+            # 从symbol_algo_map中移除算法实例
+            for vt_symbol, algos in self.symbol_algo_map.items():
                 if algo in algos:
                     algos.remove(algo)
+                    # 如果该交易对没有其他算法在运行,则退订行情
+                    if not algos:
+                        contract = self.main_engine.get_contract(vt_symbol)
+                        if contract:
+                            self.unsubscribe(contract.symbol, contract.exchange, contract.gateway_name)
+                            self.write_log(f"退订行情: {vt_symbol}")
 
         event: Event = Event(EVENT_ALGO_UPDATE, data)
         self.event_engine.put(event)

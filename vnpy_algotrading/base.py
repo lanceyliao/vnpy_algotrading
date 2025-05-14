@@ -23,6 +23,7 @@ AlgoStatusEnum = EnumId(
 )
 AlgoTemplateEnum = EnumId(
     "VolumeFollowAlgo",
+    "VolumeFollowSyncAlgo",
     "TwapAlgo",
     "IcebergAlgo", 
     "SniperAlgo",
